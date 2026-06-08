@@ -1,0 +1,13 @@
+# Code owners — review duty for bwoc-gateway.
+# Referenced by CONTRIBUTING.md. A matching owner is auto-requested for review
+# on every PR touching the pattern. Syntax: <pattern> <owner...>.
+# Docs: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+
+# Single maintainer owns the whole tree until a maintainers team is formed.
+* @kla-bemindlabs
+
+# Security-sensitive surfaces — auth, presence, and wire framing — always get owner review.
+/crates/gateway-server/src/auth.rs      @kla-bemindlabs
+/crates/gateway-server/src/presence.rs  @kla-bemindlabs
+/crates/gateway-server/src/wire.rs      @kla-bemindlabs
+/SECURITY.md                            @kla-bemindlabs

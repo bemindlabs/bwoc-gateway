@@ -45,6 +45,10 @@ curl localhost:8787/healthz          # → ok
 MVP scaffold: signed-challenge auth + presence + online relay-by-recipient.
 **Deferred:** durable store-and-forward, end-to-end body encryption, multi-gateway federation, the `routes.toml` `RouteTarget::Gateway` wiring in the framework.
 
+## Contributing
+
+PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). This is an untrusted-ingress security service, so changes preserve the [security invariants](SECURITY.md#security-invariants) (no sender forgery, presence ≠ identity, no trust elevation). Report vulnerabilities privately per [SECURITY.md](SECURITY.md), not via public issues. By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 MIT.

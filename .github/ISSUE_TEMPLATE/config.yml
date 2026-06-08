@@ -1,0 +1,10 @@
+# Issue-template chooser config.
+# Off-template questions route to email; security disclosure routes to SECURITY.md.
+blank_issues_enabled: false
+contact_links:
+  - name: Security disclosure (do not open a public issue)
+    url: https://github.com/bemindlabs/bwoc-gateway/blob/main/SECURITY.md
+    about: Report a vulnerability privately. See SECURITY.md for the disclosure process.
+  - name: Questions & support
+    url: mailto:info@bemind.tech
+    about: General questions, setup help, and contact — email the maintainers.
