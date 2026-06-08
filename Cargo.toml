@@ -9,7 +9,7 @@ license = "MIT"
 repository = "https://github.com/bemindlabs/bwoc-gateway"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util", "fs"] }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -19,3 +19,12 @@ getrandom = "0.2"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Federation: gateway-to-gateway HTTP. rustls (no system OpenSSL) for portable, static-ish builds.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# E2E body encryption (client-side): ed25519 keypair → x25519 sealed box.
+crypto_box = { version = "0.9", features = ["seal"] }
+curve25519-dalek = "4"
+sha2 = "0.10"
+# Client WebSocket transport.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
