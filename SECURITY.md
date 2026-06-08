@@ -1,6 +1,6 @@
 # Security Policy
 
-`bwoc-gateway` is, by design, an **untrusted-ingress relay** — it sits on the open internet and accepts connections from agents it cannot vouch for. Its security posture is therefore not "trust the gateway" but "the gateway can be hostile and the system still holds." See [`README.md` § Design principle](README.md#design-principle--a-dumb-untrusted-relay).
+`bwoc-gateway` is, by design, an **untrusted-ingress relay** — it sits on the open internet and accepts connections from agents it cannot vouch for. Its security posture is therefore not "trust the gateway" but "the gateway can be hostile and the system still holds." See [`README.md` § Design principle](README.md#-design-principle--a-dumb-untrusted-relay).
 
 ## Reporting a Vulnerability
 

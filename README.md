@@ -1,4 +1,6 @@
-# bwoc-gateway
+<div align="center">
+
+# 📡 bwoc-gateway
 
 **Rendezvous + relay server for multi-place agent communication.**
 
@@ -7,12 +9,14 @@
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
 [![Docs](https://img.shields.io/badge/docs-EN%20%7C%20TH-blue.svg)](docs/)
-[![Status](https://img.shields.io/badge/status-MVP-green.svg)](#status)
+[![Status](https://img.shields.io/badge/status-MVP-green.svg)](#-status)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+</div>
 
 BWOC agents normally reach each other by direct connectivity — A2A over HTTP, an MQTT broker, or `routes.toml` peer paths. That breaks across NAT, firewalls, and the open internet. `bwoc-gateway` is an **optional** server that lets agents in *different places* (machines, networks, orgs) exchange messages without direct reachability.
 
-## Design principle — a dumb, untrusted relay
+## 🧭 Design principle — a dumb, untrusted relay
 
 The gateway never becomes a central authority (BWOC is deliberately decentralized — *no central registry*, end-to-end signed envelopes, Kalyāṇamitta-7 trust):
 
@@ -20,7 +24,7 @@ The gateway never becomes a central authority (BWOC is deliberately decentralize
 - **Presence, not identity.** An agent's identity is its keypair, not a gateway account. The gateway only maps `agent_id → live connection` and routes on the cleartext `recipient` header.
 - **No trust elevation.** Authorization (Kalyāṇamitta-7) and capability gating stay in the *receiving* harness. The gateway is the untrusted-ingress edge — it inherits Phase 5 *saṃvara* discipline (TLS, per-agent rate-limits, signature checks at the door).
 
-## Protocol (MVP)
+## 🔌 Protocol (MVP)
 
 ```
 client ──WS──▶ /v1/connect
@@ -32,7 +36,7 @@ client ──WS──▶ /v1/connect
 
 The keypair **is** the login — no passwords, no server-side accounts.
 
-## Layout
+## 🗂️ Layout
 
 ```
 crates/gateway-server/   axum WebSocket server: auth, presence, relay (the bwoc-gateway binary)
@@ -41,22 +45,22 @@ docs/{en,th}/            bilingual design docs
 deploy/                  Dockerfile (+ compose) — long-running service
 ```
 
-## Run
+## ▶️ Run
 
 ```bash
 cargo run -p gateway-server          # listens on 0.0.0.0:8787 (BWOC_GATEWAY_ADDR to override)
 curl localhost:8787/healthz          # → ok
 ```
 
-## Status
+## 📊 Status
 
 MVP scaffold: signed-challenge auth + presence + online relay-by-recipient.
 **Deferred:** durable store-and-forward, end-to-end body encryption, multi-gateway federation, the `routes.toml` `RouteTarget::Gateway` wiring in the framework.
 
-## Contributing
+## 🤝 Contributing
 
 PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). This is an untrusted-ingress security service, so changes preserve the [security invariants](SECURITY.md#security-invariants) (no sender forgery, presence ≠ identity, no trust elevation). Report vulnerabilities privately per [SECURITY.md](SECURITY.md), not via public issues. By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## License
+## 📄 License
 
 MIT.

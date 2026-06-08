@@ -12,7 +12,7 @@ What problem are you trying to solve? Concrete examples beat abstract goals — 
 
 ## Proposed solution
 
-How would you address it? If it touches the wire protocol, sketch the message flow (see the Protocol section in [`README.md`](../../README.md#protocol-mvp)).
+How would you address it? If it touches the wire protocol, sketch the message flow (see the Protocol section in [`README.md`](../../README.md#-protocol-mvp)).
 
 ## Alternatives considered
 
@@ -26,7 +26,7 @@ Other approaches you weighed, and why this one wins.
 
 ## Design-principle alignment
 
-Does the proposal keep the gateway a **dumb, untrusted relay**? Confirm it does not add server-side identity, central registry, or trust elevation — or explain why an exception is warranted (see [`README.md` § Design principle](../../README.md#design-principle--a-dumb-untrusted-relay)).
+Does the proposal keep the gateway a **dumb, untrusted relay**? Confirm it does not add server-side identity, central registry, or trust elevation — or explain why an exception is warranted (see [`README.md` § Design principle](../../README.md#-design-principle--a-dumb-untrusted-relay)).
 
 ## Additional context
 

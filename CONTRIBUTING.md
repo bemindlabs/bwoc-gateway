@@ -11,7 +11,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 - **Report a bug** — open an issue using the *Bug report* template.
 - **Suggest an enhancement** — open an issue using the *Feature request* template.
 - **Improve documentation** — typos, clarifications, bilingual (English/Thai) parity under `docs/{en,th}/`.
-- **Work a deferred feature** — durable store-and-forward, end-to-end body encryption, multi-gateway federation, or the framework-side `routes.toml` `RouteTarget::Gateway` wiring (see Status in [README.md](README.md#status)). Open an issue first to align on the wire protocol.
+- **Work a deferred feature** — durable store-and-forward, end-to-end body encryption, multi-gateway federation, or the framework-side `routes.toml` `RouteTarget::Gateway` wiring (see Status in [README.md](README.md#-status)). Open an issue first to align on the wire protocol.
 
 ---
 
