@@ -11,12 +11,17 @@
 //!   - Authorization (Kalyāṇamitta-7) and capability gating stay in the
 //!     receiving harness. The gateway never elevates trust.
 //!
-//! MVP (this scaffold): persistent WebSocket per agent, signed-challenge auth
-//! (the keypair IS the login), online relay-by-recipient. Deferred: durable
-//! store-and-forward, end-to-end body encryption, multi-gateway federation.
+//! This build: persistent WebSocket per agent, signed-challenge auth (the
+//! keypair IS the login), online relay-by-recipient, **durable store-and-forward**
+//! for offline recipients (`store`), and **multi-gateway federation** (`federation`).
+//! Delivery order for an inbound envelope: local presence → peer gateways →
+//! park for store-and-forward. End-to-end body encryption is a client-side
+//! concern (`gateway-client::crypto`); the relay keeps treating `body` as opaque.
 
 mod auth;
+mod federation;
 mod presence;
+mod store;
 mod wire;
 
 use axum::{
@@ -25,12 +30,22 @@ use axum::{
         State, WebSocketUpgrade,
     },
     response::IntoResponse,
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
+use federation::{FederateResult, Federation};
 use presence::Presence;
 use std::sync::Arc;
+use store::Store;
 use wire::{ClientHello, Envelope, ServerFrame};
+
+/// Shared relay state, cheap to clone (everything behind `Arc`).
+#[derive(Clone)]
+struct AppState {
+    presence: Arc<Presence>,
+    store: Arc<Store>,
+    federation: Arc<Federation>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -41,11 +56,19 @@ async fn main() {
         )
         .init();
 
-    let presence = Arc::new(Presence::default());
+    let state = AppState {
+        presence: Arc::new(Presence::default()),
+        store: Arc::new(Store::from_env().await),
+        federation: Arc::new(Federation::from_env()),
+    };
+
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/connect", get(ws_upgrade))
-        .with_state(presence);
+        // Gateway-to-gateway: a peer asks us to deliver to a *locally* connected
+        // agent. We never re-federate from here, so federation cannot loop.
+        .route("/v1/federate", post(federate))
+        .with_state(state);
 
     let addr = std::env::var("BWOC_GATEWAY_ADDR").unwrap_or_else(|_| "0.0.0.0:8787".into());
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -55,15 +78,24 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-async fn ws_upgrade(
-    ws: WebSocketUpgrade,
-    State(presence): State<Arc<Presence>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, presence))
+async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-/// One connection: signed-challenge auth → register presence → relay loop.
-async fn handle_socket(mut socket: WebSocket, presence: Arc<Presence>) {
+/// Federation ingress: deliver `env` only if its recipient is connected *here*.
+/// Loop-safe by construction — this handler never forwards onward.
+async fn federate(
+    State(state): State<AppState>,
+    Json(env): Json<Envelope>,
+) -> Json<FederateResult> {
+    let delivered = state.presence.route(&env).await;
+    tracing::debug!(recipient = %env.recipient, delivered, "federation ingress");
+    Json(FederateResult { delivered })
+}
+
+/// One connection: signed-challenge auth → register presence → drain parked
+/// mail → relay loop.
+async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let agent_id = match authenticate(&mut socket).await {
         Ok(id) => id,
         Err(e) => {
@@ -76,7 +108,21 @@ async fn handle_socket(mut socket: WebSocket, presence: Arc<Presence>) {
 
     // Inbound queue: other connections push envelopes addressed to this agent.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Envelope>(256);
-    presence.register(agent_id.clone(), tx).await;
+    state.presence.register(agent_id.clone(), tx).await;
+
+    // Store-and-forward: flush anything parked while this agent was offline,
+    // oldest first, before entering the live relay loop.
+    for env in state.store.drain(&agent_id).await {
+        let frame = ServerFrame::Deliver(env);
+        if socket
+            .send(Message::Text(frame.to_json().into()))
+            .await
+            .is_err()
+        {
+            state.presence.unregister(&agent_id).await;
+            return;
+        }
+    }
 
     // Single-task relay loop over the one socket: deliver queued envelopes to
     // this agent, and route envelopes this agent sends to their recipient.
@@ -98,21 +144,11 @@ async fn handle_socket(mut socket: WebSocket, presence: Arc<Presence>) {
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(txt))) => match Envelope::from_json(txt.as_str()) {
-                        Ok(env) => {
-                            // Route on the cleartext `recipient` header only. The
-                            // gateway does NOT verify the signature (the recipient
-                            // harness does) and cannot forge `sender`.
-                            if !presence.route(&env).await {
-                                tracing::debug!(
-                                    recipient = %env.recipient,
-                                    "recipient offline; dropped (store-and-forward deferred)"
-                                );
-                            }
-                        }
+                        Ok(env) => deliver(&state, env).await,
                         Err(e) => tracing::warn!(error = %e, "bad envelope; ignored"),
                     },
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {} // ignore ping/pong/binary in MVP
+                    Some(Ok(_)) => {} // ignore ping/pong/binary
                     Some(Err(e)) => {
                         tracing::debug!(error = %e, "socket error");
                         break;
@@ -122,8 +158,24 @@ async fn handle_socket(mut socket: WebSocket, presence: Arc<Presence>) {
         }
     }
 
-    presence.unregister(&agent_id).await;
+    state.presence.unregister(&agent_id).await;
     tracing::info!(%agent_id, "agent disconnected");
+}
+
+/// Deliver an envelope, escalating reachability: local presence → peer gateways
+/// (federation) → durable store-and-forward. The gateway routes on the cleartext
+/// `recipient` only; it never verifies the signature (the recipient harness does)
+/// and cannot forge `sender`.
+async fn deliver(state: &AppState, env: Envelope) {
+    if state.presence.route(&env).await {
+        return; // delivered to a locally-connected agent
+    }
+    if state.federation.forward(&env).await {
+        tracing::debug!(recipient = %env.recipient, "delivered via peer gateway");
+        return;
+    }
+    tracing::debug!(recipient = %env.recipient, "recipient offline; parking for store-and-forward");
+    state.store.park(env).await;
 }
 
 /// Signed-challenge handshake. The client sends `ClientHello{agent_id, pubkey}`;

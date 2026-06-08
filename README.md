@@ -12,7 +12,7 @@ The gateway never becomes a central authority (BWOC is deliberately decentralize
 - **Presence, not identity.** An agent's identity is its keypair, not a gateway account. The gateway only maps `agent_id → live connection` and routes on the cleartext `recipient` header.
 - **No trust elevation.** Authorization (Kalyāṇamitta-7) and capability gating stay in the *receiving* harness. The gateway is the untrusted-ingress edge — it inherits Phase 5 *saṃvara* discipline (TLS, per-agent rate-limits, signature checks at the door).
 
-## Protocol (MVP)
+## Protocol
 
 ```
 client ──WS──▶ /v1/connect
@@ -20,15 +20,21 @@ client ──WS──▶ /v1/connect
   ◀ Challenge   { nonce }
   → { signature }              # nonce signed with the agent's ed25519 key
   ⇄ Envelope { recipient, sender, signature, body }   # relayed by recipient
+
+gateway ──HTTP──▶ POST /v1/federate { Envelope }      # peer-to-peer (federation)
+  ◀ { delivered: bool }                               # delivered to a *local* agent? (never re-forwards)
 ```
 
-The keypair **is** the login — no passwords, no server-side accounts.
+The keypair **is** the login — no passwords, no server-side accounts. Delivery
+escalates: **local presence → peer gateways (federation) → durable
+store-and-forward**. The `body` is opaque — seal it end-to-end with
+`gateway-client`'s `crypto` so the relay carries only ciphertext.
 
 ## Layout
 
 ```
-crates/gateway-server/   axum WebSocket server: auth, presence, relay (the bwoc-gateway binary)
-crates/gateway-client/   connector for agents/harness (→ framework RouteTarget::Gateway)
+crates/gateway-server/   axum server: auth, presence, store-and-forward, federation, relay (the bwoc-gateway binary)
+crates/gateway-client/   connector + e2e crypto for agents/harness (→ framework RouteTarget::Gateway)
 docs/{en,th}/            bilingual design docs
 deploy/                  Dockerfile (+ compose) — long-running service
 ```
@@ -40,10 +46,21 @@ cargo run -p gateway-server          # listens on 0.0.0.0:8787 (BWOC_GATEWAY_ADD
 curl localhost:8787/healthz          # → ok
 ```
 
+Optional environment:
+
+```bash
+BWOC_GATEWAY_STORE_DIR=/var/lib/bwoc-gateway   # durable store-and-forward (default: in-memory)
+BWOC_GATEWAY_PEERS=https://gw-eu.example,https://gw-us.example   # federation peers (default: none)
+```
+
 ## Status
 
-MVP scaffold: signed-challenge auth + presence + online relay-by-recipient.
-**Deferred:** durable store-and-forward, end-to-end body encryption, multi-gateway federation, the `routes.toml` `RouteTarget::Gateway` wiring in the framework.
+Online relay-by-recipient with signed-challenge auth (the keypair is the login),
+**durable store-and-forward** for offline recipients, **multi-gateway
+federation** (loop-safe single-hop peer forwarding), and a real WebSocket
+**client + end-to-end body encryption** (ed25519→x25519 sealed box).
+**Deferred:** the `routes.toml` `RouteTarget::Gateway` wiring in the framework
+(separate repo).
 
 ## License
 
