@@ -2,6 +2,14 @@
 
 **Rendezvous + relay server for multi-place agent communication.**
 
+[![CI](https://github.com/bemindlabs/bwoc-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/bemindlabs/bwoc-gateway/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
+[![Docs](https://img.shields.io/badge/docs-EN%20%7C%20TH-blue.svg)](docs/)
+[![Status](https://img.shields.io/badge/status-MVP-green.svg)](#status)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 BWOC agents normally reach each other by direct connectivity — A2A over HTTP, an MQTT broker, or `routes.toml` peer paths. That breaks across NAT, firewalls, and the open internet. `bwoc-gateway` is an **optional** server that lets agents in *different places* (machines, networks, orgs) exchange messages without direct reachability.
 
 ## Design principle — a dumb, untrusted relay
