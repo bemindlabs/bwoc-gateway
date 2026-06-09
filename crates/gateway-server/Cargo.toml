@@ -22,3 +22,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true
+
+[dev-dependencies]
+# Drive the live binary end-to-end in tests/relay_integration.rs.
+gateway-client = { path = "../gateway-client" }
