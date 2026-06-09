@@ -67,6 +67,9 @@ async fn run() -> Result<(), String> {
         .send(&envelope)
         .await
         .map_err(|e| format!("send: {e}"))?;
+    // Graceful close so the relay reads the frame before we exit (no
+    // lost-on-exit race for this one-shot sender).
+    client.close().await.map_err(|e| format!("close: {e}"))?;
     Ok(())
 }
 

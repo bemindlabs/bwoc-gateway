@@ -143,6 +143,18 @@ impl GatewayClient {
         Ok(())
     }
 
+    /// Gracefully close the connection: send a Close frame and drain the stream
+    /// until the relay completes the close handshake. A one-shot sender MUST
+    /// call this after `send` — otherwise the process can exit (dropping the TCP
+    /// socket) before the relay has read the just-sent frame, silently losing
+    /// the message.
+    pub async fn close(&mut self) -> Result<(), ClientError> {
+        self.ws.close(None).await?;
+        // Drain until the server's close ack ends the stream.
+        while self.ws.next().await.transpose()?.is_some() {}
+        Ok(())
+    }
+
     /// Await the next envelope delivered to us, or `None` when the stream ends.
     pub async fn next_envelope(&mut self) -> Result<Option<Envelope>, ClientError> {
         while let Some(t) = next_text(&mut self.ws).await? {
