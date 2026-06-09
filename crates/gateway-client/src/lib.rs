@@ -143,15 +143,19 @@ impl GatewayClient {
         Ok(())
     }
 
-    /// Gracefully close the connection: send a Close frame and drain the stream
-    /// until the relay completes the close handshake. A one-shot sender MUST
-    /// call this after `send` — otherwise the process can exit (dropping the TCP
-    /// socket) before the relay has read the just-sent frame, silently losing
-    /// the message.
+    /// Flush and close the connection so a one-shot sender's just-sent frame is
+    /// read by the relay before the process exits (otherwise the socket can drop
+    /// before the relay reads it, silently losing the message).
+    ///
+    /// Best-effort and **error-tolerant**: send a Close frame, then drain until
+    /// the stream ends. The relay closes abruptly (a reset, not a graceful close
+    /// handshake) after it breaks its relay loop — that surfaces as a
+    /// `ConnectionReset` here and is expected, NOT a failure: by then it has
+    /// already read and routed our frame. So drain errors are swallowed; only
+    /// the prior `send` reports real send failures.
     pub async fn close(&mut self) -> Result<(), ClientError> {
-        self.ws.close(None).await?;
-        // Drain until the server's close ack ends the stream.
-        while self.ws.next().await.transpose()?.is_some() {}
+        let _ = self.ws.close(None).await;
+        while let Some(Ok(_)) = self.ws.next().await {}
         Ok(())
     }
 
