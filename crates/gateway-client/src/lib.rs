@@ -143,6 +143,22 @@ impl GatewayClient {
         Ok(())
     }
 
+    /// Flush and close the connection so a one-shot sender's just-sent frame is
+    /// read by the relay before the process exits (otherwise the socket can drop
+    /// before the relay reads it, silently losing the message).
+    ///
+    /// Best-effort and **error-tolerant**: send a Close frame, then drain until
+    /// the stream ends. The relay closes abruptly (a reset, not a graceful close
+    /// handshake) after it breaks its relay loop — that surfaces as a
+    /// `ConnectionReset` here and is expected, NOT a failure: by then it has
+    /// already read and routed our frame. So drain errors are swallowed; only
+    /// the prior `send` reports real send failures.
+    pub async fn close(&mut self) -> Result<(), ClientError> {
+        let _ = self.ws.close(None).await;
+        while let Some(Ok(_)) = self.ws.next().await {}
+        Ok(())
+    }
+
     /// Await the next envelope delivered to us, or `None` when the stream ends.
     pub async fn next_envelope(&mut self) -> Result<Option<Envelope>, ClientError> {
         while let Some(t) = next_text(&mut self.ws).await? {

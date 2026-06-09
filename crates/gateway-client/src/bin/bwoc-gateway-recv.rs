@@ -53,7 +53,19 @@ async fn run() -> Result<(), String> {
 
     loop {
         match client.next_envelope().await {
-            Ok(Some(env)) => append_inbox(&args.inbox, &env.body)?,
+            Ok(Some(env)) => {
+                // Security guard at the ingress boundary: a relayed message can
+                // NEVER be from the local-trusted `user` principal — `user` is
+                // the operator at the local IPC, not a remote sender. The
+                // recipient's trust gate auto-passes `from = "user"`, so letting
+                // a relayed `user` envelope reach the inbox would forge local
+                // trust. Drop it outright.
+                if env.body.get("from").and_then(|v| v.as_str()) == Some("user") {
+                    eprintln!("bwoc-gateway-recv: dropped a relayed envelope claiming from=user");
+                    continue;
+                }
+                append_inbox(&args.inbox, &env.body)?;
+            }
             // Stream closed by the relay — exit non-zero so the supervisor
             // respawns us (a fresh connection).
             Ok(None) => return Err("relay closed the connection".into()),
