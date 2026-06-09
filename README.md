@@ -9,7 +9,7 @@
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
 [![Docs](https://img.shields.io/badge/docs-EN%20%7C%20TH-blue.svg)](docs/)
-[![Status](https://img.shields.io/badge/status-MVP-green.svg)](#-status)
+[![Status](https://img.shields.io/badge/status-v0.1.0%20released-brightgreen.svg)](#-status)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 </div>
