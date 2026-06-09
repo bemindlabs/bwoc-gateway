@@ -7,9 +7,9 @@
 [![CI](https://github.com/bemindlabs/bwoc-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/bemindlabs/bwoc-gateway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](CHANGELOG.md)
 [![Docs](https://img.shields.io/badge/docs-EN%20%7C%20TH-blue.svg)](docs/)
-[![Status](https://img.shields.io/badge/status-v0.1.0%20released-brightgreen.svg)](#-status)
+[![Status](https://img.shields.io/badge/status-v1.0.0%20stable-brightgreen.svg)](#-status)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 </div>
@@ -67,12 +67,12 @@ BWOC_GATEWAY_PEERS=https://gw-eu.example,https://gw-us.example   # federation pe
 
 ## 📊 Status
 
-Online relay-by-recipient with signed-challenge auth (the keypair is the login),
-**durable store-and-forward** for offline recipients, **multi-gateway
-federation** (loop-safe single-hop peer forwarding), and a real WebSocket
-**client + end-to-end body encryption** (ed25519→x25519 sealed box).
-**Deferred:** the `routes.toml` `RouteTarget::Gateway` wiring in the framework
-(separate repo).
+**v1.0.0 — stable.** Online relay-by-recipient with signed-challenge auth (the
+keypair is the login), **durable store-and-forward** for offline recipients,
+**multi-gateway federation** (loop-safe single-hop peer forwarding), and a real
+WebSocket **client + end-to-end body encryption** (ed25519→x25519 sealed box).
+The framework-side `routes.toml` `transport = "gateway"` wiring shipped in
+BWOC-Framework 2.28.0. Deployed and live-verified cross-machine.
 
 ## 🤝 Contributing
 
