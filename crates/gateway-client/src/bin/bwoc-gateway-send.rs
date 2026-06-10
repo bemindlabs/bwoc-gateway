@@ -25,12 +25,18 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use ed25519_dalek::SigningKey;
-use gateway_client::{Envelope, GatewayClient, GatewayConfig};
+use gateway_client::{DeliveryStatus, Envelope, GatewayClient, GatewayConfig};
+
+/// Exit code when the recipient was offline and the message was only *parked*
+/// (durably queued, not delivered live). Distinct from success so callers can
+/// tell "handed to a live agent" from "stored for later" — the whole point of
+/// the receipt is to end the old "exit 0 but never arrived" blind spot.
+const EXIT_PARKED: u8 = 4;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("bwoc-gateway-send: {e}");
             ExitCode::FAILURE
@@ -38,7 +44,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), String> {
+async fn run() -> Result<ExitCode, String> {
     let args = Args::parse()?;
 
     let signing_key = load_key(&args.key_file)?;
@@ -59,7 +65,9 @@ async fn run() -> Result<(), String> {
         body,
     };
 
-    let config = GatewayConfig::new(args.url, args.agent_id);
+    // Send-only: do NOT register presence, so we cannot evict this agent's
+    // receiver (which shares our `agent_id`).
+    let config = GatewayConfig::sender(args.url, args.agent_id);
     let mut client = GatewayClient::connect(&config, &signing_key)
         .await
         .map_err(|e| format!("connect: {e}"))?;
@@ -67,10 +75,35 @@ async fn run() -> Result<(), String> {
         .send(&envelope)
         .await
         .map_err(|e| format!("send: {e}"))?;
-    // Graceful close so the relay reads the frame before we exit (no
+
+    // Wait for the relay's delivery receipt BEFORE closing, so the exit code
+    // reflects what actually happened (delivered vs parked) rather than always 0.
+    let receipt = client
+        .await_receipt()
+        .await
+        .map_err(|e| format!("await receipt: {e}"))?;
+    // Graceful close so the relay reads our frames before we exit (no
     // lost-on-exit race for this one-shot sender).
     client.close().await.map_err(|e| format!("close: {e}"))?;
-    Ok(())
+
+    match receipt {
+        Some(r) => match r.status {
+            DeliveryStatus::Delivered => {
+                eprintln!("bwoc-gateway-send: delivered to {}", r.recipient);
+                Ok(ExitCode::SUCCESS)
+            }
+            DeliveryStatus::Parked => {
+                eprintln!(
+                    "bwoc-gateway-send: recipient {} offline — parked (not delivered live)",
+                    r.recipient
+                );
+                Ok(ExitCode::from(EXIT_PARKED))
+            }
+        },
+        // Relay closed without acking: we cannot confirm delivery → fail loudly
+        // rather than silently exit 0.
+        None => Err("no delivery receipt from relay (delivery unconfirmed)".into()),
+    }
 }
 
 /// Load a hex-encoded 32-byte ed25519 seed from `path` (trailing whitespace ok).

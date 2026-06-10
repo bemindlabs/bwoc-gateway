@@ -29,13 +29,29 @@ pub struct GatewayConfig {
     pub url: String,
     /// The agent id this connection presents.
     pub agent_id: String,
+    /// Whether this connection registers to *receive* (presence). Receivers set
+    /// `true`; a one-shot sender sets `false` so it does not evict the agent's
+    /// live receiver (which shares the same `agent_id`).
+    pub recv: bool,
 }
 
 impl GatewayConfig {
+    /// A receiving connection (registers presence). The default intent.
     pub fn new(url: impl Into<String>, agent_id: impl Into<String>) -> Self {
         Self {
             url: url.into(),
             agent_id: agent_id.into(),
+            recv: true,
+        }
+    }
+
+    /// A send-only connection: it routes the envelopes it sends but never
+    /// registers presence, so it cannot evict the agent's receiver.
+    pub fn sender(url: impl Into<String>, agent_id: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            agent_id: agent_id.into(),
+            recv: false,
         }
     }
 }
@@ -58,6 +74,27 @@ pub enum ClientError {
 struct ClientHello<'a> {
     agent_id: &'a str,
     pubkey: String,
+    /// `false` for one-shot senders so the relay does not register (and thus
+    /// evict) the agent's receiver presence slot.
+    recv: bool,
+}
+
+/// Where the relay routed an envelope this client sent (mirror of the server's
+/// `DeliveryStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    /// Handed to a live connection (local presence or a peer gateway).
+    Delivered,
+    /// Recipient offline; durably parked for store-and-forward.
+    Parked,
+}
+
+/// A delivery receipt the relay returns for a sent envelope.
+#[derive(Debug, Clone)]
+pub struct DeliveryReceipt {
+    pub recipient: String,
+    pub status: DeliveryStatus,
 }
 
 #[derive(Serialize)]
@@ -80,8 +117,14 @@ pub struct Envelope {
 enum ServerFrame {
     // The server also sends `agent_id` here; the client doesn't need it, and
     // serde ignores the extra field.
-    Challenge { nonce: String },
+    Challenge {
+        nonce: String,
+    },
     Deliver(Envelope),
+    Receipt {
+        recipient: String,
+        status: DeliveryStatus,
+    },
 }
 
 /// A live, authenticated connection to a gateway.
@@ -103,6 +146,7 @@ impl GatewayClient {
         let hello = ClientHello {
             agent_id: &config.agent_id,
             pubkey,
+            recv: config.recv,
         };
         ws.send(Message::Text(serde_json::to_string(&hello)?))
             .await?;
@@ -111,7 +155,7 @@ impl GatewayClient {
         let nonce_hex = match next_text(&mut ws).await? {
             Some(t) => match serde_json::from_str::<ServerFrame>(&t)? {
                 ServerFrame::Challenge { nonce } => nonce,
-                ServerFrame::Deliver(_) => {
+                ServerFrame::Deliver(_) | ServerFrame::Receipt { .. } => {
                     return Err(ClientError::Handshake("expected challenge"))
                 }
             },
@@ -164,7 +208,24 @@ impl GatewayClient {
         while let Some(t) = next_text(&mut self.ws).await? {
             match serde_json::from_str::<ServerFrame>(&t)? {
                 ServerFrame::Deliver(env) => return Ok(Some(env)),
-                ServerFrame::Challenge { .. } => continue, // unexpected post-auth; ignore
+                // Unexpected post-auth on a receiver; ignore and keep reading.
+                ServerFrame::Challenge { .. } | ServerFrame::Receipt { .. } => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Await the relay's delivery receipt for an envelope we just sent. Returns
+    /// `None` if the stream ends before a receipt arrives (treat as unknown /
+    /// failure). Used by one-shot senders to reflect delivery in their exit code.
+    pub async fn await_receipt(&mut self) -> Result<Option<DeliveryReceipt>, ClientError> {
+        while let Some(t) = next_text(&mut self.ws).await? {
+            match serde_json::from_str::<ServerFrame>(&t)? {
+                ServerFrame::Receipt { recipient, status } => {
+                    return Ok(Some(DeliveryReceipt { recipient, status }))
+                }
+                // A sender shouldn't get deliveries/challenges; ignore and wait.
+                ServerFrame::Deliver(_) | ServerFrame::Challenge { .. } => continue,
             }
         }
         Ok(None)
