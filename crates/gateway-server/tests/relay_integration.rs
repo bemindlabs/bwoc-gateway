@@ -5,7 +5,9 @@
 //! smoke test exercised by hand.
 
 use ed25519_dalek::SigningKey;
-use gateway_client::{crypto, Envelope, GatewayClient, GatewayConfig};
+use gateway_client::{
+    crypto, DeliveryReceipt, DeliveryStatus, Envelope, GatewayClient, GatewayConfig,
+};
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -57,6 +59,24 @@ async fn recv(client: &mut GatewayClient) -> Envelope {
         .expect("recv timed out")
         .expect("recv error")
         .expect("stream closed")
+}
+
+async fn receipt(client: &mut GatewayClient) -> DeliveryReceipt {
+    tokio::time::timeout(Duration::from_secs(5), client.await_receipt())
+        .await
+        .expect("receipt timed out")
+        .expect("receipt error")
+        .expect("stream closed before receipt")
+}
+
+/// A plaintext transport envelope tagged with a marker `m` for assertions.
+fn msg(to: &str, from: &str, marker: &str) -> Envelope {
+    Envelope {
+        recipient: to.into(),
+        sender: from.into(),
+        signature: String::new(),
+        body: serde_json::json!({ "m": marker }),
+    }
 }
 
 #[tokio::test]
@@ -126,4 +146,67 @@ async fn relay_crypto_and_store_and_forward() {
     );
 
     let _ = std::fs::remove_dir_all(&store);
+}
+
+/// Delivery receipts (delivered vs parked) and the presence self-collision fix:
+/// a one-shot **sender** must not evict the same-id **receiver**.
+#[tokio::test]
+async fn receipts_and_sender_does_not_evict_receiver() {
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_bwoc-gateway"))
+        .env("BWOC_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
+        .spawn()
+        .expect("spawn bwoc-gateway");
+    let _server = Server { child };
+    wait_ready(port).await;
+    let url = format!("ws://127.0.0.1:{port}/v1/connect");
+
+    let (r, s) = (key(20), key(21));
+
+    // Receiver online; send-only client (recv=false) relays to it.
+    let mut recv_r = GatewayClient::connect(&GatewayConfig::new(&url, "agent-r"), &r)
+        .await
+        .expect("agent-r connect");
+    let mut send = GatewayClient::connect(&GatewayConfig::sender(&url, "agent-s"), &s)
+        .await
+        .expect("agent-s sender connect");
+
+    // Online recipient → Delivered receipt.
+    send.send(&msg("agent-r", "agent-s", "live")).await.unwrap();
+    let rc = receipt(&mut send).await;
+    assert_eq!(rc.recipient, "agent-r");
+    assert_eq!(rc.status, DeliveryStatus::Delivered, "online → delivered");
+    assert_eq!(recv(&mut recv_r).await.body["m"], "live");
+
+    // Offline recipient → Parked receipt (the signal that ends "exit 0 but lost").
+    send.send(&msg("agent-ghost", "agent-s", "void"))
+        .await
+        .unwrap();
+    let rc2 = receipt(&mut send).await;
+    assert_eq!(rc2.status, DeliveryStatus::Parked, "offline → parked");
+
+    // Presence self-collision: a SENDER authenticating as `agent-r` (same id as
+    // the live receiver) must NOT evict that receiver.
+    {
+        let mut send_as_r = GatewayClient::connect(&GatewayConfig::sender(&url, "agent-r"), &r)
+            .await
+            .expect("sender-as-agent-r connect");
+        send_as_r
+            .send(&msg("agent-ghost", "agent-r", "noise"))
+            .await
+            .unwrap();
+        let _ = receipt(&mut send_as_r).await; // parked; we only care about side effects
+    } // dropped → its connection closes
+
+    // The receiver must still be registered: a fresh message reaches it.
+    send.send(&msg("agent-r", "agent-s", "still-here"))
+        .await
+        .unwrap();
+    let rc3 = receipt(&mut send).await;
+    assert_eq!(
+        rc3.status,
+        DeliveryStatus::Delivered,
+        "receiver survived a same-id sender → still delivered, not parked"
+    );
+    assert_eq!(recv(&mut recv_r).await.body["m"], "still-here");
 }

@@ -4,6 +4,16 @@ All notable changes to `bwoc-gateway` are documented here. The format is based o
 
 ## [Unreleased]
 
+### Fixed
+
+- **Log-silence root cause: wrong `EnvFilter` target.** The default directive (and the deployed `RUST_LOG`) used `gateway_server=info`, but the binary crate is `bwoc_gateway` (`[[bin]] name = "bwoc-gateway"`), so `gateway_server=…` matched **no** events and the relay looked completely log-silent. Default is now `bwoc_gateway=info`. Deployments must use `RUST_LOG=bwoc_gateway=…` (or leave it unset).
+- **Logs now go to stderr** (unbuffered) instead of block-buffered stdout, so the delivery path stays visible in `docker logs`. Delivery decisions (`delivered (local presence)` / `delivered (peer gateway)` / `parking`) are now logged at **info**.
+- **Presence self-collision.** `bwoc-gateway-send` reused the agent's own `agent_id`, and the relay registered presence for every connection (last-writer-wins) — so a one-shot send **evicted that agent's live receiver**, knocking it offline. Senders now connect with `recv = false` (new `ClientHello.recv`, defaults `true`) and the relay skips registration/store-drain/unregister for them.
+
+### Added
+
+- **Delivery receipts.** The relay returns a `Receipt { recipient, status }` (`delivered` | `parked`) for each routed envelope. `bwoc-gateway-send` waits for it and reflects it in its exit code — `0` delivered-live, `4` parked-while-offline — ending the "exit 0 but never arrived" blind spot. New `GatewayClient::await_receipt`, `GatewayConfig::sender`, and `DeliveryStatus`/`DeliveryReceipt` in `gateway-client`.
+
 ## [1.0.0] - 2026-06-09
 
 First **stable** release — the wire protocol and the `gateway-client` API are now considered stable. The relay is deployed and **live-verified cross-machine** (auth → relay → end-to-end crypto → store-and-forward) on the bemind server (`relay.bemind.tech`).

@@ -13,6 +13,17 @@ pub struct ClientHello {
     pub agent_id: String,
     /// Hex-encoded ed25519 public key (32 bytes). This is the agent's identity.
     pub pubkey: String,
+    /// Whether this connection wants to *receive* (register presence). A one-shot
+    /// sender sets `false` so it does NOT claim `agent_id`'s presence slot and
+    /// evict that agent's live receiver (`Presence::register` is last-writer-wins).
+    /// Defaults to `true` so existing receivers (which omit the field) still
+    /// register.
+    #[serde(default = "default_recv")]
+    pub recv: bool,
+}
+
+fn default_recv() -> bool {
+    true
 }
 
 impl ClientHello {
@@ -41,6 +52,19 @@ impl Envelope {
     }
 }
 
+/// Where an inbound envelope ended up — reported back to the sender as a
+/// `Receipt` so a one-shot `bwoc-gateway-send` can tell *delivered-live* from
+/// *parked-while-offline* (and reflect it in its exit code) instead of always
+/// exiting 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    /// Handed to a live connection (local presence or a peer gateway).
+    Delivered,
+    /// Recipient offline; durably parked for store-and-forward.
+    Parked,
+}
+
 /// Frames the server sends to a client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -49,6 +73,11 @@ pub enum ServerFrame {
     Challenge { agent_id: String, nonce: String },
     /// An inbound envelope addressed to this agent.
     Deliver(Envelope),
+    /// Delivery receipt for an envelope the client just sent.
+    Receipt {
+        recipient: String,
+        status: DeliveryStatus,
+    },
 }
 
 impl ServerFrame {

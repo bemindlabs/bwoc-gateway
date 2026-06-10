@@ -37,7 +37,7 @@ use federation::{FederateResult, Federation};
 use presence::Presence;
 use std::sync::Arc;
 use store::Store;
-use wire::{ClientHello, Envelope, ServerFrame};
+use wire::{ClientHello, DeliveryStatus, Envelope, ServerFrame};
 
 /// Shared relay state, cheap to clone (everything behind `Arc`).
 #[derive(Clone)]
@@ -49,10 +49,16 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    // Log to **stderr** (unbuffered) so logs aren't lost to stdout block-buffering
+    // under docker/non-TTY. The default filter targets `bwoc_gateway` — the actual
+    // binary crate name (`[[bin]] name = "bwoc-gateway"`), NOT the package name
+    // `gateway-server`. A filter of `gateway_server=…` matches NOTHING (no event
+    // has that target), which is exactly why the relay looked log-silent.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gateway_server=info".into()),
+                .unwrap_or_else(|_| "bwoc_gateway=info".into()),
         )
         .init();
 
@@ -89,14 +95,14 @@ async fn federate(
     Json(env): Json<Envelope>,
 ) -> Json<FederateResult> {
     let delivered = state.presence.route(&env).await;
-    tracing::debug!(recipient = %env.recipient, delivered, "federation ingress");
+    tracing::info!(recipient = %env.recipient, delivered, "federation ingress");
     Json(FederateResult { delivered })
 }
 
 /// One connection: signed-challenge auth → register presence → drain parked
 /// mail → relay loop.
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    let agent_id = match authenticate(&mut socket).await {
+    let (agent_id, wants_recv) = match authenticate(&mut socket).await {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(error = %e, "auth failed; closing");
@@ -104,23 +110,29 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             return;
         }
     };
-    tracing::info!(%agent_id, "agent connected");
+    tracing::info!(%agent_id, wants_recv, "agent connected");
 
     // Inbound queue: other connections push envelopes addressed to this agent.
+    // A one-shot sender (`wants_recv == false`) must NOT register: that would
+    // claim `agent_id`'s presence slot (last-writer-wins) and evict the agent's
+    // live receiver. So registration / store-drain / unregister are all gated on
+    // `wants_recv` — a pure sender only routes the envelope it pushes.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Envelope>(256);
-    state.presence.register(agent_id.clone(), tx).await;
+    if wants_recv {
+        state.presence.register(agent_id.clone(), tx).await;
 
-    // Store-and-forward: flush anything parked while this agent was offline,
-    // oldest first, before entering the live relay loop.
-    for env in state.store.drain(&agent_id).await {
-        let frame = ServerFrame::Deliver(env);
-        if socket
-            .send(Message::Text(frame.to_json().into()))
-            .await
-            .is_err()
-        {
-            state.presence.unregister(&agent_id).await;
-            return;
+        // Store-and-forward: flush anything parked while this agent was offline,
+        // oldest first, before entering the live relay loop.
+        for env in state.store.drain(&agent_id).await {
+            let frame = ServerFrame::Deliver(env);
+            if socket
+                .send(Message::Text(frame.to_json().into()))
+                .await
+                .is_err()
+            {
+                state.presence.unregister(&agent_id).await;
+                return;
+            }
         }
     }
 
@@ -144,7 +156,20 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(txt))) => match Envelope::from_json(txt.as_str()) {
-                        Ok(env) => deliver(&state, env).await,
+                        Ok(env) => {
+                            let recipient = env.recipient.clone();
+                            let status = deliver(&state, env).await;
+                            // Receipt back to the sender so it can tell delivered
+                            // from parked (and set its exit code accordingly).
+                            let receipt = ServerFrame::Receipt { recipient, status };
+                            if socket
+                                .send(Message::Text(receipt.to_json().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                         Err(e) => tracing::warn!(error = %e, "bad envelope; ignored"),
                     },
                     Some(Ok(Message::Close(_))) | None => break,
@@ -158,7 +183,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         }
     }
 
-    state.presence.unregister(&agent_id).await;
+    // Only a registered receiver owns a presence slot to clear. A pure sender
+    // never registered, so unregistering by `agent_id` here would wrongly evict
+    // that agent's *receiver* connection (same id) — guard it.
+    if wants_recv {
+        state.presence.unregister(&agent_id).await;
+    }
     tracing::info!(%agent_id, "agent disconnected");
 }
 
@@ -166,22 +196,24 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 /// (federation) → durable store-and-forward. The gateway routes on the cleartext
 /// `recipient` only; it never verifies the signature (the recipient harness does)
 /// and cannot forge `sender`.
-async fn deliver(state: &AppState, env: Envelope) {
+async fn deliver(state: &AppState, env: Envelope) -> DeliveryStatus {
     if state.presence.route(&env).await {
-        return; // delivered to a locally-connected agent
+        tracing::info!(recipient = %env.recipient, sender = %env.sender, "delivered (local presence)");
+        return DeliveryStatus::Delivered; // delivered to a locally-connected agent
     }
     if state.federation.forward(&env).await {
-        tracing::debug!(recipient = %env.recipient, "delivered via peer gateway");
-        return;
+        tracing::info!(recipient = %env.recipient, sender = %env.sender, "delivered (peer gateway)");
+        return DeliveryStatus::Delivered;
     }
-    tracing::debug!(recipient = %env.recipient, "recipient offline; parking for store-and-forward");
+    tracing::info!(recipient = %env.recipient, sender = %env.sender, "recipient offline; parking for store-and-forward");
     state.store.park(env).await;
+    DeliveryStatus::Parked
 }
 
 /// Signed-challenge handshake. The client sends `ClientHello{agent_id, pubkey}`;
 /// the server replies with a random nonce; the client returns the nonce signed
 /// with its ed25519 key. The keypair IS the login — no passwords.
-async fn authenticate(socket: &mut WebSocket) -> Result<String, auth::AuthError> {
+async fn authenticate(socket: &mut WebSocket) -> Result<(String, bool), auth::AuthError> {
     let hello: ClientHello = match socket.recv().await {
         Some(Ok(Message::Text(t))) => {
             ClientHello::from_json(t.as_str()).map_err(|_| auth::AuthError::BadHello)?
@@ -198,5 +230,5 @@ async fn authenticate(socket: &mut WebSocket) -> Result<String, auth::AuthError>
         _ => return Err(auth::AuthError::NoResponse),
     };
     challenge.verify_response(signed.as_str())?;
-    Ok(hello.agent_id)
+    Ok((hello.agent_id, hello.recv))
 }
