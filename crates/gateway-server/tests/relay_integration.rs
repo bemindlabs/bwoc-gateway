@@ -210,3 +210,74 @@ async fn receipts_and_sender_does_not_evict_receiver() {
     );
     assert_eq!(recv(&mut recv_r).await.body["m"], "still-here");
 }
+
+/// Heartbeat must NOT kill a healthy receiver. The real recv bridge sits
+/// continuously in its read loop (`next_envelope`), so it pongs every server
+/// ping the instant it arrives. This models that: a receiver reading
+/// continuously in a task must stay registered across many sub-second heartbeat
+/// rounds — a fresh sender after the idle window still gets `Delivered` (not
+/// `Parked`) and the message reaches the receiver. A connection the heartbeat
+/// false-killed would have lost its presence slot and the send would park.
+#[tokio::test]
+async fn heartbeat_does_not_evict_a_live_receiver() {
+    let port = free_port();
+    let store = std::env::temp_dir().join(format!("bwoc-gw-hb-{}-{port}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_bwoc-gateway"))
+        .env("BWOC_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
+        .env("BWOC_GATEWAY_STORE_DIR", &store)
+        // Fast heartbeat so the idle window below spans several ping/pong rounds.
+        .env("BWOC_GATEWAY_HEARTBEAT_SECS", "0.2")
+        .spawn()
+        .expect("spawn bwoc-gateway");
+    let _server = Server { child };
+    wait_ready(port).await;
+    let url = format!("ws://127.0.0.1:{port}/v1/connect");
+
+    let (a, b) = (key(22), key(23));
+    let mut recv_b = GatewayClient::connect(&GatewayConfig::new(&url, "agent-b"), &b)
+        .await
+        .expect("agent-b auth+connect");
+
+    // Receiver reads continuously (like the real recv bridge) → pongs each ping.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let reader = tokio::spawn(async move {
+        while let Ok(Some(env)) = recv_b.next_envelope().await {
+            if tx
+                .send(env.body["m"].as_str().unwrap_or_default().to_string())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Idle well past several heartbeat intervals (0.2s × ~7) — the continuously
+    // reading receiver must survive.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Fresh sender after the window; its delivery proves recv_b is still online.
+    let mut send_a = GatewayClient::connect(&GatewayConfig::sender(&url, "agent-a"), &a)
+        .await
+        .expect("agent-a sender connect");
+    send_a
+        .send(&msg("agent-b", "agent-a", "alive"))
+        .await
+        .unwrap();
+    let rc = receipt(&mut send_a).await;
+    assert_eq!(
+        rc.status,
+        DeliveryStatus::Delivered,
+        "continuously-reading receiver must survive heartbeats → delivered, not parked"
+    );
+
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("receiver delivery timed out")
+        .expect("reader channel closed");
+    assert_eq!(got, "alive");
+
+    reader.abort();
+    let _ = std::fs::remove_dir_all(&store);
+}

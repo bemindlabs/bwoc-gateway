@@ -36,6 +36,7 @@ use axum::{
 use federation::{FederateResult, Federation};
 use presence::Presence;
 use std::sync::Arc;
+use std::time::Duration;
 use store::Store;
 use wire::{ClientHello, DeliveryStatus, Envelope, ServerFrame};
 
@@ -118,8 +119,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // live receiver. So registration / store-drain / unregister are all gated on
     // `wants_recv` — a pure sender only routes the envelope it pushes.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Envelope>(256);
-    if wants_recv {
-        state.presence.register(agent_id.clone(), tx).await;
+    // `token` identifies THIS registration so a stale teardown cannot evict a
+    // newer connection that took over the slot (see presence.rs). `0` for a pure
+    // sender, which never registers.
+    let token = if wants_recv {
+        let token = state.presence.register(agent_id.clone(), tx).await;
 
         // Store-and-forward: flush anything parked while this agent was offline,
         // oldest first, before entering the live relay loop.
@@ -130,16 +134,48 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 .await
                 .is_err()
             {
-                state.presence.unregister(&agent_id).await;
+                state.presence.unregister(&agent_id, token).await;
                 return;
             }
         }
-    }
+        token
+    } else {
+        0
+    };
+
+    // Liveness heartbeat: a half-open socket (e.g. a proxy/tailnet that drops
+    // the downstream direction without a Close frame) keeps this agent's
+    // presence slot registered, so the relay reports "delivered" while the
+    // bytes vanish — the silent reverse-delivery bug. We Ping each interval and
+    // require a Pong by the next one; a missing Pong means the connection is
+    // dead → break → unregister → subsequent mail parks for redelivery on
+    // reconnect.
+    //
+    // Assumption: a receiver pongs promptly. The gateway-client's read loop
+    // (`next_text`) replies to a Ping explicitly the instant it reads one, and
+    // the recv bridge sits continuously in that read — so a live receiver always
+    // pongs within microseconds and a full interval of grace is generous. (A
+    // recv connection that stops reading for a whole interval is, for our
+    // purposes, dead — which is exactly what we want to evict.)
+    let mut heartbeat = tokio::time::interval(heartbeat_interval());
+    let mut pong_pending = false;
 
     // Single-task relay loop over the one socket: deliver queued envelopes to
     // this agent, and route envelopes this agent sends to their recipient.
     loop {
         tokio::select! {
+            // Liveness: ping on each tick; a tick with a still-pending pong from
+            // the previous round means the peer is gone.
+            _ = heartbeat.tick() => {
+                if pong_pending {
+                    tracing::info!(%agent_id, "heartbeat: no pong within interval; closing dead connection");
+                    break;
+                }
+                if socket.send(Message::Ping(Default::default())).await.is_err() {
+                    break;
+                }
+                pong_pending = true;
+            }
             // Outbound: someone addressed this agent.
             queued = rx.recv() => {
                 match queued {
@@ -172,8 +208,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         }
                         Err(e) => tracing::warn!(error = %e, "bad envelope; ignored"),
                     },
+                    // Liveness reply: clears the pending-pong so the heartbeat
+                    // knows the peer is alive.
+                    Some(Ok(Message::Pong(_))) => pong_pending = false,
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {} // ignore ping/pong/binary
+                    Some(Ok(_)) => {} // ignore ping/binary
                     Some(Err(e)) => {
                         tracing::debug!(error = %e, "socket error");
                         break;
@@ -187,7 +226,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // never registered, so unregistering by `agent_id` here would wrongly evict
     // that agent's *receiver* connection (same id) — guard it.
     if wants_recv {
-        state.presence.unregister(&agent_id).await;
+        state.presence.unregister(&agent_id, token).await;
     }
     tracing::info!(%agent_id, "agent disconnected");
 }
@@ -208,6 +247,20 @@ async fn deliver(state: &AppState, env: Envelope) -> DeliveryStatus {
     tracing::info!(recipient = %env.recipient, sender = %env.sender, "recipient offline; parking for store-and-forward");
     state.store.park(env).await;
     DeliveryStatus::Parked
+}
+
+/// Heartbeat ping cadence. A receiver connection is closed if it misses a pong
+/// for a full interval (so dead-connection detection takes [interval, 2×interval]).
+/// Defaults to 30s; `BWOC_GATEWAY_HEARTBEAT_SECS` overrides it (accepts a
+/// fractional value so tests can drive a sub-second cadence). A non-positive or
+/// unparseable value falls back to the default.
+fn heartbeat_interval() -> Duration {
+    std::env::var("BWOC_GATEWAY_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|s| *s > 0.0 && s.is_finite())
+        .map(Duration::from_secs_f64)
+        .unwrap_or(Duration::from_secs(30))
 }
 
 /// Signed-challenge handshake. The client sends `ClientHello{agent_id, pubkey}`;
