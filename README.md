@@ -35,6 +35,10 @@ client ──WS──▶ /v1/connect
 
 gateway ──HTTP──▶ POST /v1/federate { Envelope }      # peer-to-peer (federation)
   ◀ { delivered: bool }                               # delivered to a *local* agent? (never re-forwards)
+
+provider ─HTTP─▶ POST /v1/resource/advertise { snapshot, kinds, ttl }   # publish a live offer
+consumer ─HTTP─▶ POST /v1/resource/discover { kind, min spec }          # find matching offers
+  ◀ [ offers ]                                        # best-free-VRAM first, TTL-evicted registry
 ```
 
 The keypair **is** the login — no passwords, no server-side accounts. Delivery
@@ -42,10 +46,12 @@ escalates: **local presence → peer gateways (federation) → durable
 store-and-forward**. The `body` is opaque — seal it end-to-end with
 `gateway-client`'s `crypto` so the relay carries only ciphertext.
 
+The `/v1/resource/*` routes are the **discovery half of the BWOC Resource Protocol** — an in-memory, TTL-evicted offer registry (providers advertise a `ResourceSnapshot` + kinds; consumers discover by kind + minimum spec). It is discovery only: the `RES.CLAIM → RES.LEASE` handshake rides the existing signed-envelope relay, so the broker never mints a lease or executes work.
+
 ## 🗂️ Layout
 
 ```
-crates/gateway-server/   axum server: auth, presence, store-and-forward, federation, relay (the bwoc-gateway binary)
+crates/gateway-server/   axum server: auth, presence, store-and-forward, federation, relay, resource broker (the bwoc-gateway binary)
 crates/gateway-client/   connector + e2e crypto for agents/harness (→ framework RouteTarget::Gateway)
 docs/{en,th}/            bilingual design docs
 deploy/                  Dockerfile (+ compose) — long-running service
@@ -72,7 +78,9 @@ keypair is the login), **durable store-and-forward** for offline recipients,
 **multi-gateway federation** (loop-safe single-hop peer forwarding), and a real
 WebSocket **client + end-to-end body encryption** (ed25519→x25519 sealed box).
 The framework-side `routes.toml` `transport = "gateway"` wiring shipped in
-BWOC-Framework 2.28.0. Deployed and live-verified cross-machine.
+BWOC-Framework 2.28.0. Deployed and live-verified cross-machine. Also carries a
+**resource broker** — an in-memory, TTL-evicted offer registry (the discovery
+half of the BWOC Resource Protocol) over `POST /v1/resource/{advertise,discover}`.
 
 ## 🤝 Contributing
 

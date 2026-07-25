@@ -25,13 +25,14 @@ gateway เป็นพื้นผิว **untrusted-ingress** บนอิน�
 
 - **การยืนยันตัวตน = signed challenge** agent ลงนาม nonce ของ server ด้วย ed25519 key; keypair คือ login ไม่มีรหัสผ่าน ไม่มี account ให้ถูกเจาะ
 - **ลายเซ็น end-to-end** envelope ลงนามโดย agent *ผู้ส่ง*; gateway ปลอม `sender` ไม่ได้ ผู้รับ verify ลายเซ็นเอง
-- **ไม่เชื่อ payload** gateway route ตาม header `recipient` ที่เป็น cleartext เท่านั้น ไม่ตีความหรือรับรอง body (การเข้ารหัส body แบบ E2E — ให้ relay อ่าน payload ไม่ได้ด้วยซ้ำ — เป็น fast-follow ที่วางแผนไว้)
+- **ไม่เชื่อ payload** gateway route ตาม header `recipient` ที่เป็น cleartext เท่านั้น ไม่ตีความหรือรับรอง body (การเข้ารหัส body แบบ E2E — ให้ relay อ่าน payload ไม่ได้ด้วยซ้ำ — มีให้ใช้แล้วใน `gateway-client::crypto`)
 - **การควบคุมที่ขอบ** TLS, rate limit ต่อ agent, queue มีขอบเขต การอนุญาตแบบ capability/Kalyāṇamitta-7 ยังอยู่ที่ harness ฝั่งผู้รับ — gateway ไม่เคยยกระดับ trust
 
 ## โรดแมป
 
-1. **MVP (scaffold):** WS relay + signed-challenge auth + presence + relay ออนไลน์
-2. **store-and-forward** ทนทานสำหรับผู้รับที่ออฟไลน์
-3. **การเข้ารหัส body แบบ end-to-end** (relay route ตาม header อ่าน content ไม่ได้)
-4. การต่อกับ framework: `RouteTarget::Gateway` ใน `routes.toml` + `gateway-client` ที่ harness ขับ
-5. **federation หลาย gateway** (gateway peer กันเพื่อ relay ข้าม region/องค์กร)
+1. ✅ **MVP (scaffold):** WS relay + signed-challenge auth + presence + relay ออนไลน์
+2. ✅ **store-and-forward** ทนทานสำหรับผู้รับที่ออฟไลน์
+3. ✅ **การเข้ารหัส body แบบ end-to-end** (relay route ตาม header อ่าน content ไม่ได้)
+4. ✅ การต่อกับ framework: `RouteTarget::Gateway` ใน `routes.toml` + `gateway-client` ที่ harness ขับ (BWOC-Framework 2.28.0)
+5. ✅ **federation หลาย gateway** (gateway peer กันเพื่อ relay ข้าม region/องค์กร)
+6. ✅ **resource broker** — ครึ่งฝั่ง discovery ของ BWOC Resource Protocol (registry ของ offer แบบ in-memory ที่ evict ตาม TTL; claim/lease วิ่งผ่าน relay)
