@@ -25,13 +25,14 @@ The gateway is, by definition, an **untrusted-ingress surface** on the open inte
 
 - **Authentication = signed challenge.** The agent signs a server nonce with its ed25519 key; the keypair is the login. No passwords, no accounts to breach.
 - **End-to-end signatures.** Envelopes are signed by the *sender* agent; the gateway cannot forge `sender`. The recipient verifies the signature itself.
-- **No payload trust.** The gateway routes on the cleartext `recipient` header only; it does not interpret or vouch for the body. (E2E body encryption — so the relay cannot even read payloads — is a planned fast-follow.)
+- **No payload trust.** The gateway routes on the cleartext `recipient` header only; it does not interpret or vouch for the body. (E2E body encryption — so the relay cannot even read payloads — ships in `gateway-client::crypto`.)
 - **Edge controls.** TLS, per-agent rate limiting, bounded queues. Capability/Kalyāṇamitta-7 authorization remains in the receiving harness — the gateway never elevates trust.
 
 ## Roadmap
 
-1. **MVP (scaffold):** WS relay + signed-challenge auth + presence + online relay.
-2. Durable **store-and-forward** for offline recipients.
-3. **End-to-end body encryption** (relay routes on header, cannot read content).
-4. Framework wiring: a `RouteTarget::Gateway` in `routes.toml` + a `gateway-client` the harness drives.
-5. **Multi-gateway federation** (gateways peer to relay across regions/orgs).
+1. ✅ **MVP (scaffold):** WS relay + signed-challenge auth + presence + online relay.
+2. ✅ Durable **store-and-forward** for offline recipients.
+3. ✅ **End-to-end body encryption** (relay routes on header, cannot read content).
+4. ✅ Framework wiring: a `RouteTarget::Gateway` in `routes.toml` + a `gateway-client` the harness drives (BWOC-Framework 2.28.0).
+5. ✅ **Multi-gateway federation** (gateways peer to relay across regions/orgs).
+6. ✅ **Resource broker** — the discovery half of the BWOC Resource Protocol (in-memory, TTL-evicted offer registry; claim/lease rides the relay).
