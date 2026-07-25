@@ -4,6 +4,10 @@ All notable changes to `bwoc-gateway` are documented here. The format is based o
 
 ## [Unreleased]
 
+### Added
+
+- **Resource broker — the discovery half of the BWOC Resource Protocol** (framework `docs/en/RESOURCE-PROTOCOL.en.md`, slice B). Two new HTTP routes turn the relay into the fleet's resource-offer registry: `POST /v1/resource/advertise` (a provider publishes its `ResourceSnapshot` + offered kinds + a TTL) and `POST /v1/resource/discover` (a consumer queries by kind + minimum spec — `min_vram_mb` / `min_ram_mb` / `min_cpu_cores` — and gets matching live offers, best-free-VRAM first). The registry is in-memory and **TTL-evicted** (clamped ≤ 300 s), one live offer per provider id (last-writer-wins), so a crashed provider self-evicts and registry pollution stays bounded. True to the dumb-untrusted-relay grain: the broker never mints a lease and never executes work — the `RES.CLAIM` → `RES.LEASE` round trip rides the existing signed-envelope relay, and trust is deferred to the consumer verifying the provider's lease signature. 6 unit tests (kind match, min-spec filter, best-fit sort, last-writer-wins, TTL eviction + clamp).
+
 ### Fixed
 
 - **Relayed inbox envelopes dropped the authenticated sender id + timestamp** (#321). `bwoc-gateway-recv` appended the inner `body` verbatim, so a body without `from`/`ts` (e.g. a raw `{"text":"hi"}`) landed in the recipient's `.bwoc/inbox.jsonl` with no usable sender or time — downstream tooling rendered `from = "?"` and had no per-message timestamp. recv now stamps the **ed25519-authenticated** `Envelope.sender` as `from` and a receive `ts` into the persisted body **when those fields are absent**. Present fields are never overwritten — a signed inner envelope carries its own `from`/`ts` in its signed payload, so signature verification stays valid. A relayed envelope whose authenticated `sender` is `user` is dropped too (the local-operator principal can never be a remote sender).

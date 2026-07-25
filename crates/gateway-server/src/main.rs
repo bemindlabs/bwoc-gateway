@@ -21,6 +21,7 @@
 mod auth;
 mod federation;
 mod presence;
+mod resource;
 mod store;
 mod wire;
 
@@ -46,6 +47,7 @@ struct AppState {
     presence: Arc<Presence>,
     store: Arc<Store>,
     federation: Arc<Federation>,
+    resources: Arc<resource::ResourceRegistry>,
 }
 
 #[tokio::main]
@@ -67,6 +69,7 @@ async fn main() {
         presence: Arc::new(Presence::default()),
         store: Arc::new(Store::from_env().await),
         federation: Arc::new(Federation::from_env()),
+        resources: Arc::new(resource::ResourceRegistry::default()),
     };
 
     let app = Router::new()
@@ -75,6 +78,10 @@ async fn main() {
         // Gateway-to-gateway: a peer asks us to deliver to a *locally* connected
         // agent. We never re-federate from here, so federation cannot loop.
         .route("/v1/federate", post(federate))
+        // Resource broker (discovery half): providers advertise a snapshot,
+        // consumers discover matching offers. Claim/lease rides the relay.
+        .route("/v1/resource/advertise", post(resource::advertise))
+        .route("/v1/resource/discover", post(resource::discover))
         .with_state(state);
 
     let addr = std::env::var("BWOC_GATEWAY_ADDR").unwrap_or_else(|_| "0.0.0.0:8787".into());
