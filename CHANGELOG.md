@@ -4,6 +4,10 @@ All notable changes to `bwoc-gateway` are documented here. The format is based o
 
 ## [Unreleased]
 
+### Fixed
+
+- **Resource broker hardening** (Copilot review of the broker PR). Three fixes: `discover` no longer holds the registry mutex across its `O(n log n)` sort (the lock scope now ends before the sort, so it can't block a concurrent advertise/discover or pin a Tokio worker); `snapshot_cpu_cores` clamps `u64 → u32` instead of `as`-truncating (an untrusted snapshot's absurd core count can no longer wrap small and spuriously pass a `min_cpu_cores` filter); and the registry gained a hard `MAX_OFFERS` count cap (soonest-expiry eviction) so a flood of distinct `provider` ids can't grow the in-memory map without bound — TTL bounds time, this bounds count. 2 new tests.
+
 ### Added
 
 - **Resource broker — the discovery half of the BWOC Resource Protocol** (framework `docs/en/RESOURCE-PROTOCOL.en.md`, slice B). Two new HTTP routes turn the relay into the fleet's resource-offer registry: `POST /v1/resource/advertise` (a provider publishes its `ResourceSnapshot` + offered kinds + a TTL) and `POST /v1/resource/discover` (a consumer queries by kind + minimum spec — `min_vram_mb` / `min_ram_mb` / `min_cpu_cores` — and gets matching live offers, best-free-VRAM first). The registry is in-memory and **TTL-evicted** (clamped ≤ 300 s), one live offer per provider id (last-writer-wins), so a crashed provider self-evicts and registry pollution stays bounded. True to the dumb-untrusted-relay grain: the broker never mints a lease and never executes work — the `RES.CLAIM` → `RES.LEASE` round trip rides the existing signed-envelope relay, and trust is deferred to the consumer verifying the provider's lease signature. 6 unit tests (kind match, min-spec filter, best-fit sort, last-writer-wins, TTL eviction + clamp).

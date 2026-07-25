@@ -15,8 +15,9 @@
 //!   - **Trust is deferred to the lease.** The registry does not verify the
 //!     advertise signature — a spoofed offer is a phantom that fails at claim
 //!     time (the provider never responds / the consumer can't verify the lease
-//!     signature). One live offer per `provider` id (last-writer-wins) + TTL
-//!     eviction bounds registry pollution.
+//!     signature). One live offer per `provider` id (last-writer-wins), TTL
+//!     eviction (time bound), and a hard `MAX_OFFERS` count cap (soonest-expiry
+//!     eviction) together bound registry pollution under a distinct-id flood.
 //!
 //! The registry is a cache of live offers, never a system of record.
 
@@ -55,6 +56,12 @@ pub struct ResourceRegistry {
 /// Guard: an absurd TTL (a provider trying to pin an offer forever) is clamped.
 const MAX_TTL_SECS: u64 = 300;
 
+/// Hard cap on distinct live offers. TTL eviction bounds *time*; this bounds
+/// *count* — a flood of distinct `provider` ids (each valid up to `MAX_TTL_SECS`)
+/// can't grow the map without limit. At the cap, a new provider evicts the
+/// soonest-to-expire existing offer (same spirit as `Store`'s `MAX_PER_RECIPIENT`).
+const MAX_OFFERS: usize = 1024;
+
 impl ResourceRegistry {
     /// Insert/replace this provider's offer, expiring after `ttl_secs` (clamped
     /// to `MAX_TTL_SECS`, floored at 1s). Returns the count of live offers after
@@ -62,6 +69,19 @@ impl ResourceRegistry {
     pub fn advertise(&self, offer: Offer, ttl_secs: u64, now: Instant) -> usize {
         let ttl = Duration::from_secs(ttl_secs.clamp(1, MAX_TTL_SECS));
         let mut map = self.offers.lock().expect("registry lock");
+        evict_expired(&mut map, now);
+        // A *new* provider at the cap evicts the soonest-to-expire entry so the
+        // map stays bounded even under a distinct-id flood. Refreshing an
+        // existing provider (already keyed) never trips this.
+        if !map.contains_key(&offer.provider) && map.len() >= MAX_OFFERS {
+            if let Some(victim) = map
+                .iter()
+                .min_by_key(|(_, s)| s.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&victim);
+            }
+        }
         map.insert(
             offer.provider.clone(),
             StoredOffer {
@@ -69,21 +89,24 @@ impl ResourceRegistry {
                 expires_at: now + ttl,
             },
         );
-        evict_expired(&mut map, now);
         map.len()
     }
 
     /// Return the live offers matching `query`, best-fit first (most free VRAM,
     /// then most free RAM). Evicts expired entries as a side effect.
     pub fn discover(&self, query: &DiscoverQuery, now: Instant) -> Vec<Offer> {
-        let mut map = self.offers.lock().expect("registry lock");
-        evict_expired(&mut map, now);
-        let mut out: Vec<Offer> = map
-            .values()
-            .map(|s| &s.offer)
-            .filter(|o| offer_matches(o, query))
-            .cloned()
-            .collect();
+        // Scope the lock to the collect — the (potentially O(n log n)) sort runs
+        // after the guard drops, so it never blocks a concurrent advertise/
+        // discover (nor pins a Tokio worker thread on the mutex).
+        let mut out: Vec<Offer> = {
+            let mut map = self.offers.lock().expect("registry lock");
+            evict_expired(&mut map, now);
+            map.values()
+                .map(|s| &s.offer)
+                .filter(|o| offer_matches(o, query))
+                .cloned()
+                .collect()
+        };
         out.sort_by(|a, b| {
             snapshot_best_vram(&b.snapshot)
                 .cmp(&snapshot_best_vram(&a.snapshot))
@@ -160,9 +183,12 @@ fn snapshot_ram_free(snap: &serde_json::Value) -> u64 {
 }
 
 fn snapshot_cpu_cores(snap: &serde_json::Value) -> u32 {
+    // Snapshots are untrusted/opaque — clamp rather than `as`-truncate, so an
+    // absurd `cpu_cores` stays "very large" and can't wrap to a small number
+    // that would wrongly pass a `min_cpu_cores` filter.
     snap.get("cpu_cores")
         .and_then(serde_json::Value::as_u64)
-        .map(|n| n as u32)
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
         .unwrap_or(0)
 }
 
@@ -352,6 +378,54 @@ mod tests {
         assert_eq!(reg.live_count(now), 1);
         let later = now + Duration::from_secs(6);
         assert_eq!(reg.live_count(later), 0, "offer expired after its TTL");
+    }
+
+    #[test]
+    fn registry_is_count_bounded() {
+        let reg = ResourceRegistry::default();
+        let now = Instant::now();
+        // Flood with more distinct providers than the cap allows.
+        for i in 0..(MAX_OFFERS + 50) {
+            reg.advertise(
+                offer(&format!("p{i}"), &["compute"], 1000, 1000, 1),
+                300,
+                now,
+            );
+        }
+        assert!(
+            reg.live_count(now) <= MAX_OFFERS,
+            "distinct-provider flood must stay bounded by MAX_OFFERS"
+        );
+    }
+
+    #[test]
+    fn huge_cpu_cores_clamps_not_wraps() {
+        // cpu_cores far beyond u32::MAX must stay "large" (clamp), so a min-cores
+        // filter still matches — not wrap to a small number that spuriously fails.
+        let snap = json!({ "gpus": [], "cpu_cores": u64::MAX, "ram_free_mb": 1000 });
+        assert_eq!(snapshot_cpu_cores(&snap), u32::MAX);
+        let reg = ResourceRegistry::default();
+        let now = Instant::now();
+        reg.advertise(
+            Offer {
+                provider: "big".into(),
+                kinds: vec!["compute".into()],
+                snapshot: snap,
+            },
+            30,
+            now,
+        );
+        let q = DiscoverQuery {
+            kind: "compute".into(),
+            min_vram_mb: None,
+            min_ram_mb: None,
+            min_cpu_cores: Some(1_000_000),
+        };
+        assert_eq!(
+            reg.discover(&q, now).len(),
+            1,
+            "huge core count must satisfy the min filter"
+        );
     }
 
     #[test]
