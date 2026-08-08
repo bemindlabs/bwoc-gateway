@@ -20,6 +20,11 @@
 //! The key file holds the sender's hex-encoded 32-byte ed25519 seed — used only
 //! for the gateway login handshake (the keypair IS the login). Reading the
 //! message from stdin avoids `ARG_MAX` (E2BIG) on long messages.
+//!
+//! Every read is bounded (30 s by default, `BWOC_GATEWAY_SEND_READ_TIMEOUT_SECS`
+//! to override, `0` to disable): on a half-open socket neither the challenge nor
+//! the delivery receipt ever arrives, and an unbounded wait would hang a caller
+//! that expected a one-shot send.
 
 use std::io::Read;
 use std::process::ExitCode;
