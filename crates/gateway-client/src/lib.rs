@@ -16,11 +16,40 @@
 
 pub mod crypto;
 
+use std::time::Duration;
+
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+
+/// Default receive-side read timeout: 3× the server's 30 s liveness heartbeat.
+///
+/// The server Pings every `BWOC_GATEWAY_HEARTBEAT_SECS` (default 30 s), so a
+/// live connection delivers *some* frame well inside this window even when it
+/// is otherwise idle. Going three intervals without a single frame therefore
+/// means the socket is half-open, not quiet.
+const DEFAULT_RECV_READ_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long a receiving connection may go without reading **any** frame before
+/// it is declared dead. `None` disables the check.
+///
+/// Override with `BWOC_GATEWAY_RECV_READ_TIMEOUT_SECS`; `0` (or a negative /
+/// non-finite value) disables it, an unparseable value falls back to the
+/// default rather than silently disabling the guard.
+pub fn recv_read_timeout() -> Option<Duration> {
+    let Ok(raw) = std::env::var("BWOC_GATEWAY_RECV_READ_TIMEOUT_SECS") else {
+        return Some(DEFAULT_RECV_READ_TIMEOUT);
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(secs) if secs > 0.0 && secs.is_finite() => Some(Duration::from_secs_f64(secs)),
+        // An explicit 0 / negative / inf means "disable" — the operator asked.
+        Ok(_) => None,
+        // Garbage must not disable a liveness guard: fail safe to the default.
+        Err(_) => Some(DEFAULT_RECV_READ_TIMEOUT),
+    }
+}
 
 /// Configuration for a gateway connection.
 #[derive(Debug, Clone)]
@@ -66,6 +95,12 @@ pub enum ClientError {
     Handshake(&'static str),
     #[error("connection closed")]
     Closed,
+    /// No frame — not even the server's liveness Ping — arrived in time. The
+    /// socket is half-open: the relay has already evicted us and every message
+    /// addressed here is being parked. Surfacing this as an error (rather than
+    /// blocking forever) is what lets the supervisor respawn us and reconnect.
+    #[error("read timeout: no frame from the relay in {0:?}; connection is half-open")]
+    ReadTimeout(Duration),
 }
 
 // ---- wire types (mirror gateway-server/src/wire.rs) ----------------------
@@ -131,6 +166,9 @@ enum ServerFrame {
 pub struct GatewayClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     agent_id: String,
+    /// Liveness guard for the long-lived receive loop; `None` on one-shot
+    /// senders, which are bounded by their own send/receipt round-trip.
+    read_timeout: Option<Duration>,
 }
 
 impl GatewayClient {
@@ -140,6 +178,13 @@ impl GatewayClient {
         signing_key: &SigningKey,
     ) -> Result<Self, ClientError> {
         let (mut ws, _) = connect_async(&config.url).await?;
+        // Receivers hold this socket open indefinitely, so they need the
+        // liveness guard; a sender's exchange is bounded by its own receipt.
+        let read_timeout = if config.recv {
+            recv_read_timeout()
+        } else {
+            None
+        };
 
         // 1. ClientHello
         let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
@@ -152,7 +197,7 @@ impl GatewayClient {
             .await?;
 
         // 2. Challenge → sign nonce
-        let nonce_hex = match next_text(&mut ws).await? {
+        let nonce_hex = match next_text(&mut ws, read_timeout).await? {
             Some(t) => match serde_json::from_str::<ServerFrame>(&t)? {
                 ServerFrame::Challenge { nonce } => nonce,
                 ServerFrame::Deliver(_) | ServerFrame::Receipt { .. } => {
@@ -172,6 +217,7 @@ impl GatewayClient {
         Ok(Self {
             ws,
             agent_id: config.agent_id.clone(),
+            read_timeout,
         })
     }
 
@@ -205,7 +251,7 @@ impl GatewayClient {
 
     /// Await the next envelope delivered to us, or `None` when the stream ends.
     pub async fn next_envelope(&mut self) -> Result<Option<Envelope>, ClientError> {
-        while let Some(t) = next_text(&mut self.ws).await? {
+        while let Some(t) = next_text(&mut self.ws, self.read_timeout).await? {
             match serde_json::from_str::<ServerFrame>(&t)? {
                 ServerFrame::Deliver(env) => return Ok(Some(env)),
                 // Unexpected post-auth on a receiver; ignore and keep reading.
@@ -219,7 +265,7 @@ impl GatewayClient {
     /// `None` if the stream ends before a receipt arrives (treat as unknown /
     /// failure). Used by one-shot senders to reflect delivery in their exit code.
     pub async fn await_receipt(&mut self) -> Result<Option<DeliveryReceipt>, ClientError> {
-        while let Some(t) = next_text(&mut self.ws).await? {
+        while let Some(t) = next_text(&mut self.ws, self.read_timeout).await? {
             match serde_json::from_str::<ServerFrame>(&t)? {
                 ServerFrame::Receipt { recipient, status } => {
                     return Ok(Some(DeliveryReceipt { recipient, status }))
@@ -234,10 +280,27 @@ impl GatewayClient {
 
 /// Pull the next text frame, transparently answering pings and skipping other
 /// control/binary frames.
+///
+/// `read_timeout` bounds the wait for **each frame**, not for the next *text*
+/// frame — an idle-but-healthy connection still carries the server's periodic
+/// Ping, which resets the clock. Bounding the text-frame wait instead would tear
+/// down perfectly good connections that simply have no mail to deliver.
 async fn next_text(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    read_timeout: Option<Duration>,
 ) -> Result<Option<String>, ClientError> {
-    while let Some(msg) = ws.next().await {
+    loop {
+        // Scoped so the `ws.next()` borrow ends before we Pong on the same `ws`.
+        let frame = {
+            let next = ws.next();
+            match read_timeout {
+                Some(d) => tokio::time::timeout(d, next)
+                    .await
+                    .map_err(|_| ClientError::ReadTimeout(d))?,
+                None => next.await,
+            }
+        };
+        let Some(msg) = frame else { return Ok(None) };
         match msg? {
             Message::Text(t) => return Ok(Some(t.to_string())),
             Message::Ping(p) => ws.send(Message::Pong(p)).await?,
@@ -245,7 +308,6 @@ async fn next_text(
             _ => {}
         }
     }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -256,6 +318,45 @@ mod tests {
     fn config_builds() {
         let c = GatewayConfig::new("wss://example/v1/connect", "agent-erlang");
         assert_eq!(c.agent_id, "agent-erlang");
+    }
+
+    /// One test, sequential cases: the env var is process-global, so splitting
+    /// these into separate `#[test]`s would let the parallel harness race them.
+    #[test]
+    fn recv_read_timeout_env_matrix() {
+        const VAR: &str = "BWOC_GATEWAY_RECV_READ_TIMEOUT_SECS";
+
+        // Unset → the default guard is ON. This is the case that matters: the
+        // bridge must never idle forever just because nobody configured it.
+        std::env::remove_var(VAR);
+        assert_eq!(recv_read_timeout(), Some(DEFAULT_RECV_READ_TIMEOUT));
+        assert!(
+            DEFAULT_RECV_READ_TIMEOUT >= Duration::from_secs(90),
+            "default must clear several server heartbeats or healthy idle \
+             connections get torn down"
+        );
+
+        std::env::set_var(VAR, "45");
+        assert_eq!(recv_read_timeout(), Some(Duration::from_secs(45)));
+
+        std::env::set_var(VAR, " 12.5 ");
+        assert_eq!(recv_read_timeout(), Some(Duration::from_secs_f64(12.5)));
+
+        // Explicit opt-out.
+        std::env::set_var(VAR, "0");
+        assert_eq!(recv_read_timeout(), None);
+        std::env::set_var(VAR, "-5");
+        assert_eq!(recv_read_timeout(), None);
+
+        // Garbage must fail *safe* (guard on), not silently disable it.
+        std::env::set_var(VAR, "banana");
+        assert_eq!(recv_read_timeout(), Some(DEFAULT_RECV_READ_TIMEOUT));
+        std::env::set_var(VAR, "");
+        assert_eq!(recv_read_timeout(), Some(DEFAULT_RECV_READ_TIMEOUT));
+        std::env::set_var(VAR, "inf");
+        assert_eq!(recv_read_timeout(), None, "non-finite is not a duration");
+
+        std::env::remove_var(VAR);
     }
 
     #[test]
