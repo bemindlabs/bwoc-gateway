@@ -378,7 +378,7 @@ mod tests {
     /// vars are process-global, so a second `#[test]` touching either of them
     /// would race this one under the parallel harness.
     #[test]
-    fn recv_read_timeout_env_matrix() {
+    fn read_timeout_env_matrix() {
         const VAR: &str = "BWOC_GATEWAY_RECV_READ_TIMEOUT_SECS";
 
         // Unset → the default guard is ON. This is the case that matters: the
