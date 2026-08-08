@@ -32,6 +32,14 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 /// means the socket is half-open, not quiet.
 const DEFAULT_RECV_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Default send-side read timeout.
+///
+/// A one-shot sender only ever waits for the challenge and the delivery
+/// receipt, both of which the relay emits immediately — a receipt says *parked*
+/// rather than stalling when the recipient is offline. So 30 s is already
+/// generous, and anything longer is a stuck socket, not a slow relay.
+const DEFAULT_SEND_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long a receiving connection may go without reading **any** frame before
 /// it is declared dead. `None` disables the check.
 ///
@@ -39,20 +47,39 @@ const DEFAULT_RECV_READ_TIMEOUT: Duration = Duration::from_secs(90);
 /// non-finite value) disables it, an unparseable value falls back to the
 /// default rather than silently disabling the guard.
 pub fn recv_read_timeout() -> Option<Duration> {
-    let Ok(raw) = std::env::var("BWOC_GATEWAY_RECV_READ_TIMEOUT_SECS") else {
-        return Some(DEFAULT_RECV_READ_TIMEOUT);
+    read_timeout_from_env(
+        "BWOC_GATEWAY_RECV_READ_TIMEOUT_SECS",
+        DEFAULT_RECV_READ_TIMEOUT,
+    )
+}
+
+/// The same guard for one-shot senders, which otherwise block forever awaiting
+/// a challenge or a delivery receipt that a half-open socket will never carry.
+///
+/// Override with `BWOC_GATEWAY_SEND_READ_TIMEOUT_SECS`; same semantics as
+/// [`recv_read_timeout`].
+pub fn send_read_timeout() -> Option<Duration> {
+    read_timeout_from_env(
+        "BWOC_GATEWAY_SEND_READ_TIMEOUT_SECS",
+        DEFAULT_SEND_READ_TIMEOUT,
+    )
+}
+
+fn read_timeout_from_env(var: &str, default: Duration) -> Option<Duration> {
+    let Ok(raw) = std::env::var(var) else {
+        return Some(default);
     };
     match raw.trim().parse::<f64>() {
         // `try_from_secs_f64` (not `from_secs_f64`) because this value is
         // operator-supplied: a finite-but-huge `1e30` overflows `Duration` and
-        // the infallible constructor would panic the bridge at startup.
+        // the infallible constructor would panic the process at startup.
         Ok(secs) if secs > 0.0 && secs.is_finite() => {
-            Some(Duration::try_from_secs_f64(secs).unwrap_or(DEFAULT_RECV_READ_TIMEOUT))
+            Some(Duration::try_from_secs_f64(secs).unwrap_or(default))
         }
         // An explicit 0 / negative / inf means "disable" — the operator asked.
         Ok(_) => None,
         // Garbage must not disable a liveness guard: fail safe to the default.
-        Err(_) => Some(DEFAULT_RECV_READ_TIMEOUT),
+        Err(_) => Some(default),
     }
 }
 
@@ -183,12 +210,14 @@ impl GatewayClient {
         signing_key: &SigningKey,
     ) -> Result<Self, ClientError> {
         let (mut ws, _) = connect_async(&config.url).await?;
-        // Receivers hold this socket open indefinitely, so they need the
-        // liveness guard; a sender's exchange is bounded by its own receipt.
+        // Receivers hold this socket open indefinitely and so need the longer
+        // guard; a sender's whole exchange is two prompt frames, so it gets a
+        // tighter one. Both are bounded — an unbounded read is what wedged the
+        // recv bridge, and the sender can wedge the same way awaiting a receipt.
         let read_timeout = if config.recv {
             recv_read_timeout()
         } else {
-            None
+            send_read_timeout()
         };
 
         // 1. ClientHello
@@ -248,9 +277,29 @@ impl GatewayClient {
     /// `ConnectionReset` here and is expected, NOT a failure: by then it has
     /// already read and routed our frame. So drain errors are swallowed; only
     /// the prior `send` reports real send failures.
+    /// Bounded by the same read timeout: on a half-open socket the relay's
+    /// close never arrives, and an unbounded drain would hang the sender right
+    /// after it did its job. Giving up on the drain is harmless — the frame is
+    /// already on the wire — so a timeout here ends the loop instead of erroring.
     pub async fn close(&mut self) -> Result<(), ClientError> {
         let _ = self.ws.close(None).await;
-        while let Some(Ok(_)) = self.ws.next().await {}
+        let read_timeout = self.read_timeout;
+        loop {
+            let frame = {
+                let next = self.ws.next();
+                match read_timeout {
+                    Some(d) => match tokio::time::timeout(d, next).await {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    },
+                    None => next.await,
+                }
+            };
+            match frame {
+                Some(Ok(_)) => continue,
+                _ => break,
+            }
+        }
         Ok(())
     }
 
@@ -325,10 +374,11 @@ mod tests {
         assert_eq!(c.agent_id, "agent-erlang");
     }
 
-    /// One test, sequential cases: the env var is process-global, so splitting
-    /// these into separate `#[test]`s would let the parallel harness race them.
+    /// **One** test covering both timeouts, run as sequential cases: these env
+    /// vars are process-global, so a second `#[test]` touching either of them
+    /// would race this one under the parallel harness.
     #[test]
-    fn recv_read_timeout_env_matrix() {
+    fn read_timeout_env_matrix() {
         const VAR: &str = "BWOC_GATEWAY_RECV_READ_TIMEOUT_SECS";
 
         // Unset → the default guard is ON. This is the case that matters: the
@@ -371,6 +421,38 @@ mod tests {
             "an overflowing duration must fall back, not panic"
         );
 
+        // ---- the sender's own timeout, in the same test to keep it serial ----
+        const SEND: &str = "BWOC_GATEWAY_SEND_READ_TIMEOUT_SECS";
+        std::env::remove_var(VAR);
+        std::env::remove_var(SEND);
+
+        assert_eq!(send_read_timeout(), Some(DEFAULT_SEND_READ_TIMEOUT));
+        assert!(
+            DEFAULT_SEND_READ_TIMEOUT < DEFAULT_RECV_READ_TIMEOUT,
+            "a one-shot exchange should give up sooner than a long-lived bridge"
+        );
+
+        // The two vars must stay independent: tuning the long-lived bridge must
+        // not silently retune every one-shot send.
+        std::env::set_var(VAR, "7");
+        assert_eq!(
+            send_read_timeout(),
+            Some(DEFAULT_SEND_READ_TIMEOUT),
+            "the recv var must not leak into the send timeout"
+        );
+        std::env::set_var(SEND, "3");
+        assert_eq!(send_read_timeout(), Some(Duration::from_secs(3)));
+        assert_eq!(recv_read_timeout(), Some(Duration::from_secs(7)));
+
+        // Same fail-safe / opt-out semantics as the recv side.
+        std::env::set_var(SEND, "banana");
+        assert_eq!(send_read_timeout(), Some(DEFAULT_SEND_READ_TIMEOUT));
+        std::env::set_var(SEND, "1e30");
+        assert_eq!(send_read_timeout(), Some(DEFAULT_SEND_READ_TIMEOUT));
+        std::env::set_var(SEND, "0");
+        assert_eq!(send_read_timeout(), None);
+
+        std::env::remove_var(SEND);
         std::env::remove_var(VAR);
     }
 
