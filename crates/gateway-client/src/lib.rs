@@ -43,7 +43,12 @@ pub fn recv_read_timeout() -> Option<Duration> {
         return Some(DEFAULT_RECV_READ_TIMEOUT);
     };
     match raw.trim().parse::<f64>() {
-        Ok(secs) if secs > 0.0 && secs.is_finite() => Some(Duration::from_secs_f64(secs)),
+        // `try_from_secs_f64` (not `from_secs_f64`) because this value is
+        // operator-supplied: a finite-but-huge `1e30` overflows `Duration` and
+        // the infallible constructor would panic the bridge at startup.
+        Ok(secs) if secs > 0.0 && secs.is_finite() => {
+            Some(Duration::try_from_secs_f64(secs).unwrap_or(DEFAULT_RECV_READ_TIMEOUT))
+        }
         // An explicit 0 / negative / inf means "disable" — the operator asked.
         Ok(_) => None,
         // Garbage must not disable a liveness guard: fail safe to the default.
@@ -355,6 +360,16 @@ mod tests {
         assert_eq!(recv_read_timeout(), Some(DEFAULT_RECV_READ_TIMEOUT));
         std::env::set_var(VAR, "inf");
         assert_eq!(recv_read_timeout(), None, "non-finite is not a duration");
+
+        // Finite, positive, and far too large for `Duration` — the infallible
+        // `from_secs_f64` would panic here, taking the bridge down at startup
+        // on nothing worse than a fat-fingered env var.
+        std::env::set_var(VAR, "1e30");
+        assert_eq!(
+            recv_read_timeout(),
+            Some(DEFAULT_RECV_READ_TIMEOUT),
+            "an overflowing duration must fall back, not panic"
+        );
 
         std::env::remove_var(VAR);
     }
