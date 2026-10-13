@@ -119,7 +119,8 @@ bwoc-gateway-recv ... \
   now, and each `(from, messageId, nonce)` fires once. Mail parked longer than
   that is delivered but does not fire the hook.
 - Executed directly, no shell; nothing from the message reaches argv. The
-  verified sender and id are in `BWOC_GATEWAY_FROM` / `BWOC_GATEWAY_MESSAGE_ID`.
+  verified sender and id are in `BWOC_GATEWAY_FROM` / `BWOC_GATEWAY_MESSAGE_ID`,
+  and this agent's own id in `BWOC_GATEWAY_AGENT_ID`.
 - At most 4 runs at once; each is killed after `--on-message-timeout-secs`
   (default 60). The kill reaches the program, not processes it started.
 - Every message is written to the inbox first. A hook that fails, times out or

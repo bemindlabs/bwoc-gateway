@@ -53,9 +53,11 @@
 //! - The program is executed directly, never through a shell. The message
 //!   arrives on **stdin**; nothing from it is placed in argv. The verified
 //!   sender and message id are passed in `BWOC_GATEWAY_FROM` and
-//!   `BWOC_GATEWAY_MESSAGE_ID`.
+//!   `BWOC_GATEWAY_MESSAGE_ID`, and this agent's own id in
+//!   `BWOC_GATEWAY_AGENT_ID`.
 //! - Runs are bounded: at most [`HOOK_MAX_CONCURRENT`] at once (extra messages
-//!   skip the hook) and each is killed after [`HookOptions::timeout`].
+//!   skip the hook) and each is killed after [`HookOptions::timeout`], which
+//!   covers feeding it the message as well as waiting for it to exit.
 //!   The kill reaches the program itself, not processes it started, so a hook
 //!   that launches long work should `exec` it or manage its own children.
 //!
@@ -476,12 +478,20 @@ fn spawn_hook(
                 return;
             }
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            // A hook that exits without reading closes the pipe; that is its
-            // business, not an error worth more than the exit status below.
-            let _ = stdin.write_all(&line).await;
-        }
-        match tokio::time::timeout(timeout, child.wait()).await {
+        // The write is inside the timed future on purpose: a hook that never
+        // drains stdin blocks `write_all` once the message outgrows the pipe
+        // buffer, and an untimed write would hold this run's slot forever.
+        let stdin = child.stdin.take();
+        let run = async {
+            if let Some(mut stdin) = stdin {
+                // A hook that exits without reading closes the pipe; that is
+                // its business, not an error worth more than the exit status.
+                let _ = stdin.write_all(&line).await;
+            }
+            child.wait().await
+        };
+        let outcome = tokio::time::timeout(timeout, run).await;
+        match outcome {
             Ok(Ok(status)) if status.success() => {}
             Ok(Ok(status)) => eprintln!(
                 "bwoc-gateway-recv: on-message for {} exited {status}",

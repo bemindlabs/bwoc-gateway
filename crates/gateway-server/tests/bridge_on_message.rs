@@ -259,3 +259,72 @@ async fn a_hook_that_overruns_is_killed_and_mail_still_arrives() {
 
     bridge_task.abort();
 }
+
+/// A hook that never reads stdin, fed a message larger than the pipe buffer,
+/// must still be killed at the timeout — otherwise its slot is held forever
+/// and, once every slot is stuck, the hook never runs again.
+#[tokio::test]
+async fn hooks_that_never_read_stdin_do_not_wedge_the_slots() {
+    let r = relay("stdin").await;
+    let inbox = r.dir.join("b/.bwoc/inbox.jsonl");
+    let ok = r.dir.join("ok");
+
+    let script = r.dir.join("picky.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$BWOC_GATEWAY_MESSAGE_ID\" in\n  stuck-*) exec sleep 30 ;;\n  *) cat >/dev/null; touch '{}' ;;\nesac\n",
+            ok.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let sign_a = key(40);
+    let mut opts = BridgeOptions::new(&inbox);
+    opts.hook = Some(HookOptions {
+        program: script,
+        trust_keys: HashMap::from([("agent-a".to_string(), sign_a.verifying_key())]),
+        timeout: Duration::from_millis(300),
+        max_age: Duration::from_secs(300),
+    });
+    let mut bridge_b = connect(&r.url, "agent-b", 21).await;
+    let bridge_task = tokio::spawn(async move { bridge::run(&mut bridge_b, &opts).await });
+
+    let mut a = connect(&r.url, "agent-a", 20).await;
+    // Well past a 64 KiB pipe buffer, so an unread write cannot complete.
+    let big = "x".repeat(256 * 1024);
+    for i in 0..bridge::HOOK_MAX_CONCURRENT {
+        let mid = format!("stuck-{i}");
+        send(
+            &mut a,
+            "agent-b",
+            "agent-a",
+            signed(&sign_a, "agent-a", "agent-b", &mid, &big),
+        )
+        .await;
+    }
+    wait_lines(&inbox, bridge::HOOK_MAX_CONCURRENT).await;
+    // Every slot is now held by a hook that will never read. Give the timeout
+    // time to fire, then a normal message must still get a slot.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    send(
+        &mut a,
+        "agent-b",
+        "agent-a",
+        signed(&sign_a, "agent-a", "agent-b", "fine", "hello"),
+    )
+    .await;
+    for _ in 0..60 {
+        if ok.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        ok.exists(),
+        "a stuck stdin write must not hold the hook slots"
+    );
+
+    bridge_task.abort();
+}
