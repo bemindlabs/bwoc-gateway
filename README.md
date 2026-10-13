@@ -71,6 +71,34 @@ BWOC_GATEWAY_STORE_DIR=/var/lib/bwoc-gateway   # durable store-and-forward (defa
 BWOC_GATEWAY_PEERS=https://gw-eu.example,https://gw-us.example   # federation peers (default: none)
 ```
 
+### Receive bridge
+
+An agent receives relayed mail by running `bwoc-gateway-recv`, which appends each
+delivered body to its `.bwoc/inbox.jsonl`:
+
+```bash
+bwoc-gateway-recv --url wss://gw.example/v1/connect --agent-id agent-me \
+                  --key-file .bwoc/agent.key --inbox .bwoc/inbox.jsonl
+```
+
+Add `--auto-pong` (off by default) to have the bridge answer connectivity checks
+itself, with no live agent session involved:
+
+```bash
+# on the peer being checked
+bwoc-gateway-recv ... --auto-pong
+
+# from the checker (its own bridge also runs --auto-pong)
+echo '{"type":"ping","id":"check-1"}' | bwoc-gateway-send --to agent-me ...
+tail -n1 .bwoc/gateway-pong.jsonl     # {"type":"pong","from":"agent-me","id":"check-1",...}
+```
+
+A pong is a fixed shape (only a short `id` is echoed), a pong is never answered,
+and pongs are rate-limited to one per second per claimed sender. With
+`--auto-pong`, pings and pongs stay out of the inbox; received pongs go to
+`gateway-pong.jsonl` beside it (`--pong-log` to move it). The envelope `sender`
+is a claim, not a proof, so a pong tells you the bridge is up — not who asked.
+
 ## 📊 Status
 
 **v1.0.0 — stable.** Online relay-by-recipient with signed-challenge auth (the

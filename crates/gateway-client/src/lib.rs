@@ -14,6 +14,7 @@
 //! bodies may be sealed end-to-end via [`crypto`] so the relay sees only
 //! ciphertext.
 
+pub mod bridge;
 pub mod crypto;
 
 use std::time::Duration;

@@ -26,6 +26,8 @@ gateway เป็นพื้นผิว **untrusted-ingress** บนอิน�
 - **การยืนยันตัวตน = signed challenge** agent ลงนาม nonce ของ server ด้วย ed25519 key; keypair คือ login ไม่มีรหัสผ่าน ไม่มี account ให้ถูกเจาะ
 - **ลายเซ็น end-to-end** envelope ลงนามโดย agent *ผู้ส่ง*; gateway ปลอม `sender` ไม่ได้ ผู้รับ verify ลายเซ็นเอง
 - **ไม่เชื่อ payload** gateway route ตาม header `recipient` ที่เป็น cleartext เท่านั้น ไม่ตีความหรือรับรอง body (การเข้ารหัส body แบบ E2E — ให้ relay อ่าน payload ไม่ได้ด้วยซ้ำ — มีให้ใช้แล้วใน `gateway-client::crypto`)
+- **`sender` เป็นแค่คำอ้าง** relay พิสูจน์ได้ว่า connection ถือ key ที่ยื่นมา แต่ไม่ได้ผูก `agent_id` กับ key และไม่ได้เทียบ `sender` ของ envelope กับ connection มีแต่ลายเซ็นชั้นในเท่านั้นที่ระบุตัวผู้ส่งได้
+- **Auto-pong เป็น opt-in และแคบ** `bwoc-gateway-recv --auto-pong` ตอบ `{"type":"ping"}` ด้วย pong รูปแบบตายตัว ไม่ตอบ pong และจำกัดอัตราต่อ sender ที่อ้างมา ไม่รันคำสั่งใด ๆ และไม่เขียน ping/pong ลง inbox
 - **การควบคุมที่ขอบ** TLS, rate limit ต่อ agent, queue มีขอบเขต การอนุญาตแบบ capability/Kalyāṇamitta-7 ยังอยู่ที่ harness ฝั่งผู้รับ — gateway ไม่เคยยกระดับ trust
 
 ## โรดแมป
