@@ -26,6 +26,8 @@ The gateway is, by definition, an **untrusted-ingress surface** on the open inte
 - **Authentication = signed challenge.** The agent signs a server nonce with its ed25519 key; the keypair is the login. No passwords, no accounts to breach.
 - **End-to-end signatures.** Envelopes are signed by the *sender* agent; the gateway cannot forge `sender`. The recipient verifies the signature itself.
 - **No payload trust.** The gateway routes on the cleartext `recipient` header only; it does not interpret or vouch for the body. (E2E body encryption — so the relay cannot even read payloads — ships in `gateway-client::crypto`.)
+- **`sender` is a claim.** The relay proves a connection holds the key it presented, but it does not pin an `agent_id` to a key or check an envelope's `sender` against the connection. Only the inner signature identifies a sender.
+- **Auto-pong is opt-in and narrow.** `bwoc-gateway-recv --auto-pong` answers `{"type":"ping"}` with a fixed-shape pong, never answers a pong, and rate-limits per claimed sender. It runs no configured action and keeps ping/pong out of the inbox.
 - **Edge controls.** TLS, per-agent rate limiting, bounded queues. Capability/Kalyāṇamitta-7 authorization remains in the receiving harness — the gateway never elevates trust.
 
 ## Roadmap
