@@ -33,12 +33,46 @@
 //! out of the inbox: an agent is never woken by one. Received pongs are
 //! appended to [`BridgeOptions::pong_log`] for whoever sent the ping to read.
 
-use std::collections::HashMap;
+//!
+//! # On-message hook (opt-in)
+//!
+//! With [`BridgeOptions::hook`] the bridge runs one operator-configured program
+//! per message, so an agent can act on mail without a live session. The
+//! gateway stays a relay: it runs the program and nothing else.
+//!
+//! This is remote input triggering local execution, so the gate is the inner
+//! signature and never `sender`:
+//!
+//! - The hook runs only for an envelope whose `bwoc_signing` signature verifies
+//!   against a key the operator pinned for its `from` ([`HookOptions::trust_keys`]),
+//!   and whose signed `to` is this agent.
+//! - The signed `ts` must be within [`HookOptions::max_age`] of now, and a
+//!   `(from, messageId, nonce)` is accepted once, so a captured envelope cannot
+//!   be replayed. Mail parked longer than `max_age` therefore reaches the inbox
+//!   but does not fire the hook.
+//! - The program is executed directly, never through a shell. The message
+//!   arrives on **stdin**; nothing from it is placed in argv. The verified
+//!   sender and message id are passed in `BWOC_GATEWAY_FROM` and
+//!   `BWOC_GATEWAY_MESSAGE_ID`.
+//! - Runs are bounded: at most [`HOOK_MAX_CONCURRENT`] at once (extra messages
+//!   skip the hook) and each is killed after [`HookOptions::timeout`].
+//!   The kill reaches the program itself, not processes it started, so a hook
+//!   that launches long work should `exec` it or manage its own children.
+//!
+//! Every message is written to the inbox first, whatever the hook does; a hook
+//! that fails, times out or is skipped never loses mail.
+
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::Value;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 
 use crate::{Envelope, GatewayClient};
 
@@ -53,6 +87,50 @@ const PONG_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// made-up sender ids would otherwise grow the map without bound.
 const PONG_LIMITER_MAX_SENDERS: usize = 1024;
 
+/// Most hook processes alive at once. A message arriving while all are busy is
+/// still delivered to the inbox; it just does not fire the hook.
+pub const HOOK_MAX_CONCURRENT: usize = 4;
+
+/// Default wall-clock limit for one hook run.
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default freshness window for a signed `ts`, and so how long a replay is
+/// remembered.
+pub const DEFAULT_HOOK_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// Cap on remembered `(from, messageId, nonce)` triples inside the window.
+const REPLAY_MAX_ENTRIES: usize = 4096;
+
+/// The opt-in on-message hook. See the module docs for the trust rules.
+#[derive(Debug, Clone)]
+pub struct HookOptions {
+    /// Program to execute (directly, no shell) with the message on stdin.
+    pub program: PathBuf,
+    /// Pinned ed25519 public keys by agent id. Only these senders fire the hook.
+    pub trust_keys: HashMap<String, VerifyingKey>,
+    /// Kill a run that takes longer than this.
+    pub timeout: Duration,
+    /// Accept a signed `ts` at most this far from now, in either direction.
+    pub max_age: Duration,
+}
+
+/// Parse a pinned key given as `<agent-id>=<64 hex chars>`.
+pub fn parse_trust_key(spec: &str) -> Result<(String, VerifyingKey), String> {
+    let (id, hex_key) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("trust key must be <agent-id>=<pubkey-hex>: {spec}"))?;
+    if id.is_empty() || id == "user" {
+        return Err(format!("trust key has an unusable agent id: {spec}"));
+    }
+    let bytes: [u8; 32] = hex::decode(hex_key.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| format!("trust key for {id} must be 32 bytes of hex"))?;
+    let key = VerifyingKey::from_bytes(&bytes)
+        .map_err(|_| format!("trust key for {id} is not a valid ed25519 key"))?;
+    Ok((id.to_string(), key))
+}
+
 /// How the bridge should run.
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
@@ -62,6 +140,8 @@ pub struct BridgeOptions {
     pub auto_pong: bool,
     /// Where received pongs are appended (JSON lines) when `auto_pong` is on.
     pub pong_log: PathBuf,
+    /// Run a program for each verified message. `None` = off.
+    pub hook: Option<HookOptions>,
 }
 
 impl BridgeOptions {
@@ -73,6 +153,7 @@ impl BridgeOptions {
             inbox,
             auto_pong: false,
             pong_log,
+            hook: None,
         }
     }
 }
@@ -158,12 +239,29 @@ impl PongLimiter {
 /// returns `Err`: the caller exits non-zero so a supervisor respawns it, and a
 /// respawn is the reconnect.
 pub async fn run(client: &mut GatewayClient, opts: &BridgeOptions) -> Result<(), String> {
-    let mut limiter = PongLimiter::default();
+    let mut state = BridgeState::default();
     loop {
         match client.next_envelope().await {
-            Ok(Some(env)) => handle(client, opts, &mut limiter, env).await?,
+            Ok(Some(env)) => handle(client, opts, &mut state, env).await?,
             Ok(None) => return Err("relay closed the connection".into()),
             Err(e) => return Err(format!("recv: {e}")),
+        }
+    }
+}
+
+/// What the loop remembers between envelopes.
+struct BridgeState {
+    limiter: PongLimiter,
+    replay: ReplayGuard,
+    hook_slots: Arc<Semaphore>,
+}
+
+impl Default for BridgeState {
+    fn default() -> Self {
+        Self {
+            limiter: PongLimiter::default(),
+            replay: ReplayGuard::default(),
+            hook_slots: Arc::new(Semaphore::new(HOOK_MAX_CONCURRENT)),
         }
     }
 }
@@ -171,7 +269,7 @@ pub async fn run(client: &mut GatewayClient, opts: &BridgeOptions) -> Result<(),
 async fn handle(
     client: &mut GatewayClient,
     opts: &BridgeOptions,
-    limiter: &mut PongLimiter,
+    state: &mut BridgeState,
     env: Envelope,
 ) -> Result<(), String> {
     // Security guard at the ingress boundary: a relayed message can NEVER be
@@ -191,7 +289,7 @@ async fn handle(
                 if env.sender.is_empty() || env.sender == self_id {
                     return Ok(());
                 }
-                if !limiter.allow(&env.sender, Instant::now()) {
+                if !state.limiter.allow(&env.sender, Instant::now()) {
                     eprintln!(
                         "bwoc-gateway-recv: ping from {} rate-limited; no pong",
                         env.sender
@@ -223,7 +321,182 @@ async fn handle(
     // carries `from`/`ts` as part of its signed payload, so we must NOT
     // overwrite them (that would invalidate the signature).
     let body = stamp_provenance(env.body, &env.sender, &now_rfc3339());
-    append_jsonl(&opts.inbox, &body)
+    append_jsonl(&opts.inbox, &body)?;
+
+    if let Some(hook) = &opts.hook {
+        let self_id = client.agent_id();
+        match verify_for_hook(&body, self_id, hook, now_unix(), &mut state.replay) {
+            Ok(verified) => spawn_hook(hook, self_id, verified, &body, &state.hook_slots),
+            Err(why) => eprintln!("bwoc-gateway-recv: on-message not run: {why}"),
+        }
+    }
+    Ok(())
+}
+
+/// The parts of a message the signature vouches for, once it has verified.
+#[derive(Debug, PartialEq, Eq)]
+struct Verified {
+    from: String,
+    message_id: String,
+}
+
+/// Remembers accepted `(from, messageId, nonce)` triples for the freshness
+/// window so a captured envelope fires the hook once.
+#[derive(Default)]
+struct ReplayGuard {
+    /// key → the envelope's signed `ts` (unix seconds).
+    seen: HashMap<String, i64>,
+}
+
+impl ReplayGuard {
+    /// Record `key`; `false` if it was already seen or the guard is full.
+    fn first_time(&mut self, key: String, ts: i64, now: i64, max_age: i64) -> bool {
+        // Anything outside the window would be refused as stale anyway, so it
+        // no longer needs remembering.
+        self.seen.retain(|_, t| (now - *t).abs() <= max_age);
+        if self.seen.contains_key(&key) || self.seen.len() >= REPLAY_MAX_ENTRIES {
+            return false;
+        }
+        self.seen.insert(key, ts);
+        true
+    }
+}
+
+/// The RFC 8785 canonical bytes `bwoc_signing` signs: the six string fields as
+/// a JSON object with sorted keys and no whitespace. Must stay byte-identical
+/// to `bwoc_signing::canonical_bytes` — the test vector below was produced by
+/// that crate.
+fn canonical_bytes(
+    from: &str,
+    to: &str,
+    ts: &str,
+    message_id: &str,
+    message: &str,
+    nonce: &str,
+) -> Vec<u8> {
+    let map: BTreeMap<&str, &str> = BTreeMap::from([
+        ("from", from),
+        ("to", to),
+        ("ts", ts),
+        ("messageId", message_id),
+        ("message", message),
+        ("nonce", nonce),
+    ]);
+    serde_json::to_vec(&map).expect("BTreeMap<&str,&str> is always serializable")
+}
+
+/// Decide whether `body` may fire the hook. Every refusal is a reason string
+/// for the log; none of them stops the message reaching the inbox.
+fn verify_for_hook(
+    body: &Value,
+    self_id: &str,
+    hook: &HookOptions,
+    now: i64,
+    replay: &mut ReplayGuard,
+) -> Result<Verified, &'static str> {
+    let field = |k: &str| body.get(k).and_then(Value::as_str);
+    let (Some(from), Some(to), Some(ts), Some(message_id), Some(message), Some(nonce), Some(sig)) = (
+        field("from"),
+        field("to"),
+        field("ts"),
+        field("messageId"),
+        field("message"),
+        field("nonce"),
+        field("sig"),
+    ) else {
+        return Err("not a signed envelope");
+    };
+    if to != self_id {
+        return Err("signed for a different recipient");
+    }
+    let key = hook
+        .trust_keys
+        .get(from)
+        .ok_or("sender has no pinned key")?;
+    let sig: [u8; 64] = hex::decode(sig.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("bad signature")?;
+    key.verify(
+        &canonical_bytes(from, to, ts, message_id, message, nonce),
+        &Signature::from_bytes(&sig),
+    )
+    .map_err(|_| "bad signature")?;
+
+    // Only now is `ts` trustworthy enough to reason about.
+    let max_age = i64::try_from(hook.max_age.as_secs()).unwrap_or(i64::MAX);
+    let sent = rfc3339_to_unix(ts).ok_or("unreadable ts")?;
+    if (now - sent).abs() > max_age {
+        return Err("outside the freshness window");
+    }
+    if !replay.first_time(format!("{from}\n{message_id}\n{nonce}"), sent, now, max_age) {
+        return Err("replayed or replay guard full");
+    }
+    Ok(Verified {
+        from: from.to_string(),
+        message_id: message_id.to_string(),
+    })
+}
+
+/// Start the hook for a verified message without blocking the receive loop.
+fn spawn_hook(
+    hook: &HookOptions,
+    self_id: &str,
+    verified: Verified,
+    body: &Value,
+    slots: &Arc<Semaphore>,
+) {
+    let Ok(permit) = slots.clone().try_acquire_owned() else {
+        eprintln!(
+            "bwoc-gateway-recv: on-message busy ({HOOK_MAX_CONCURRENT} running); skipped {}",
+            verified.message_id
+        );
+        return;
+    };
+    let Ok(mut line) = serde_json::to_vec(body) else {
+        return;
+    };
+    line.push(b'\n');
+    let mut cmd = tokio::process::Command::new(&hook.program);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .env("BWOC_GATEWAY_FROM", &verified.from)
+        .env("BWOC_GATEWAY_MESSAGE_ID", &verified.message_id)
+        .env("BWOC_GATEWAY_AGENT_ID", self_id)
+        .kill_on_drop(true);
+    let (program, timeout) = (hook.program.clone(), hook.timeout);
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bwoc-gateway-recv: on-message {}: {e}", program.display());
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            // A hook that exits without reading closes the pipe; that is its
+            // business, not an error worth more than the exit status below.
+            let _ = stdin.write_all(&line).await;
+        }
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(status)) => eprintln!(
+                "bwoc-gateway-recv: on-message for {} exited {status}",
+                verified.message_id
+            ),
+            Ok(Err(e)) => eprintln!("bwoc-gateway-recv: on-message wait: {e}"),
+            Err(_) => {
+                let _ = child.kill().await;
+                eprintln!(
+                    "bwoc-gateway-recv: on-message for {} killed after {timeout:?}",
+                    verified.message_id
+                );
+            }
+        }
+    });
 }
 
 /// Fill in `from` (= the relay-reported `sender`, a claim — see the module
@@ -264,6 +537,52 @@ fn now_rfc3339() -> String {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     unix_to_rfc3339(secs)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse the framework's canonical `YYYY-MM-DDThh:mm:ssZ` back to unix seconds.
+/// Deliberately strict — exactly that shape, UTC only — because the value is a
+/// security input (the freshness check); anything else is refused.
+fn rfc3339_to_unix(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let s = &ts[r];
+        s.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| s.parse().ok())?
+    };
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    // days_from_civil (Howard Hinnant), the inverse of `unix_to_rfc3339`.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss;
+    // Reject dates that do not exist (e.g. Feb 30) rather than rolling them over.
+    (unix_to_rfc3339(secs) == ts).then_some(secs)
 }
 
 fn unix_to_rfc3339(secs: i64) -> String {
@@ -426,5 +745,208 @@ mod tests {
         // Once the windows pass, the stale entries make room.
         assert!(l.allow("one-more", t0 + PONG_MIN_INTERVAL));
         assert_eq!(l.last.len(), 1);
+    }
+
+    // Produced by the framework's own `bwoc_signing` crate (seed `[7; 32]`),
+    // so this pins our canonical form and verification to theirs.
+    const VEC_PUB: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+    const VEC_SIG: &str = "57ad87a3476091397cdbf43e5a9520d73efba1be5aa61346c9df4549b16a7954\
+                           c6812dd2e4a1d3db0139d72b8355d46f29a99c4e3b44914f1ad778578f547108";
+    const VEC_TS: &str = "2026-10-13T12:00:00Z";
+
+    fn vec_body() -> Value {
+        json!({
+            "from": "agent-alpha", "to": "agent-beta", "ts": VEC_TS,
+            "messageId": "msg-20261013T120000Z-ab123",
+            "message": "deploy \"now\" — ไทย\n",
+            "nonce": "00112233445566778899aabbccddeeff",
+            "sig": VEC_SIG,
+        })
+    }
+
+    fn vec_hook() -> HookOptions {
+        let (id, key) = parse_trust_key(&format!("agent-alpha={VEC_PUB}")).unwrap();
+        HookOptions {
+            program: "/bin/true".into(),
+            trust_keys: HashMap::from([(id, key)]),
+            timeout: DEFAULT_HOOK_TIMEOUT,
+            max_age: DEFAULT_HOOK_MAX_AGE,
+        }
+    }
+
+    fn vec_now() -> i64 {
+        rfc3339_to_unix(VEC_TS).unwrap()
+    }
+
+    #[test]
+    fn canonical_bytes_match_the_frameworks() {
+        let got = canonical_bytes(
+            "agent-alpha",
+            "agent-beta",
+            VEC_TS,
+            "msg-20261013T120000Z-ab123",
+            "deploy \"now\" — ไทย\n",
+            "00112233445566778899aabbccddeeff",
+        );
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            r#"{"from":"agent-alpha","message":"deploy \"now\" — ไทย\n","messageId":"msg-20261013T120000Z-ab123","nonce":"00112233445566778899aabbccddeeff","to":"agent-beta","ts":"2026-10-13T12:00:00Z"}"#
+        );
+    }
+
+    #[test]
+    fn a_framework_signed_envelope_verifies() {
+        let got = verify_for_hook(
+            &vec_body(),
+            "agent-beta",
+            &vec_hook(),
+            vec_now() + 5,
+            &mut ReplayGuard::default(),
+        );
+        assert_eq!(
+            got,
+            Ok(Verified {
+                from: "agent-alpha".into(),
+                message_id: "msg-20261013T120000Z-ab123".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_hook_gate_refuses_everything_the_signature_does_not_cover() {
+        let hook = vec_hook();
+        let check = |body: &Value, me: &str, now: i64| {
+            verify_for_hook(body, me, &hook, now, &mut ReplayGuard::default())
+        };
+
+        // Any signed field changed → the signature no longer matches.
+        for (k, v) in [
+            ("message", "deploy something else"),
+            ("ts", "2026-10-13T12:00:01Z"),
+            ("messageId", "msg-other"),
+            ("nonce", "ffffffffffffffffffffffffffffffff"),
+        ] {
+            let mut b = vec_body();
+            b[k] = json!(v);
+            assert_eq!(
+                check(&b, "agent-beta", vec_now()),
+                Err("bad signature"),
+                "{k}"
+            );
+        }
+
+        // Re-aimed at another agent: `to` is signed, and it must be us.
+        assert_eq!(
+            check(&vec_body(), "agent-gamma", vec_now()),
+            Err("signed for a different recipient")
+        );
+
+        // A sender we hold no key for — including one that just claims a name.
+        let mut b = vec_body();
+        b["from"] = json!("agent-mallory");
+        assert_eq!(
+            check(&b, "agent-beta", vec_now()),
+            Err("sender has no pinned key")
+        );
+
+        // Unsigned / partial bodies never reach verification.
+        assert_eq!(
+            check(
+                &json!({"from": "agent-alpha", "message": "hi"}),
+                "agent-beta",
+                vec_now()
+            ),
+            Err("not a signed envelope")
+        );
+        let mut b = vec_body();
+        b["sig"] = json!("00");
+        assert_eq!(check(&b, "agent-beta", vec_now()), Err("bad signature"));
+    }
+
+    #[test]
+    fn a_valid_envelope_is_refused_when_stale_or_from_the_future() {
+        let hook = vec_hook();
+        let age = DEFAULT_HOOK_MAX_AGE.as_secs() as i64;
+        let check = |now: i64| {
+            verify_for_hook(
+                &vec_body(),
+                "agent-beta",
+                &hook,
+                now,
+                &mut ReplayGuard::default(),
+            )
+        };
+        assert!(check(vec_now() + age).is_ok());
+        assert_eq!(
+            check(vec_now() + age + 1),
+            Err("outside the freshness window")
+        );
+        assert!(check(vec_now() - age).is_ok());
+        assert_eq!(
+            check(vec_now() - age - 1),
+            Err("outside the freshness window")
+        );
+    }
+
+    #[test]
+    fn a_replayed_envelope_fires_once() {
+        let hook = vec_hook();
+        let mut guard = ReplayGuard::default();
+        assert!(verify_for_hook(&vec_body(), "agent-beta", &hook, vec_now(), &mut guard).is_ok());
+        assert_eq!(
+            verify_for_hook(&vec_body(), "agent-beta", &hook, vec_now() + 1, &mut guard),
+            Err("replayed or replay guard full")
+        );
+    }
+
+    #[test]
+    fn the_replay_guard_forgets_only_what_is_already_stale() {
+        let mut g = ReplayGuard::default();
+        assert!(g.first_time("k".into(), 1000, 1000, 300));
+        assert!(!g.first_time("k".into(), 1000, 1300, 300));
+        // Past the window the entry is dropped — safe, because the same
+        // envelope is now refused as stale before it gets here.
+        assert!(g.first_time("other".into(), 1400, 1400, 300));
+        assert!(!g.seen.contains_key("k"));
+
+        let mut g = ReplayGuard::default();
+        for i in 0..REPLAY_MAX_ENTRIES {
+            assert!(g.first_time(format!("k{i}"), 0, 0, 300));
+        }
+        assert!(
+            !g.first_time("overflow".into(), 0, 0, 300),
+            "full guard fails closed"
+        );
+    }
+
+    #[test]
+    fn trust_keys_parse_strictly() {
+        assert!(parse_trust_key(&format!("agent-alpha={VEC_PUB}")).is_ok());
+        assert!(parse_trust_key(VEC_PUB).is_err(), "no agent id");
+        assert!(parse_trust_key(&format!("={VEC_PUB}")).is_err());
+        assert!(parse_trust_key("agent-alpha=abcd").is_err(), "short key");
+        assert!(parse_trust_key("agent-alpha=zz").is_err());
+        // `user` is the local operator and can never be a remote sender.
+        assert!(parse_trust_key(&format!("user={VEC_PUB}")).is_err());
+    }
+
+    #[test]
+    fn rfc3339_parses_only_the_canonical_shape() {
+        for secs in [0, 1_700_000_000, 1_709_208_000, 4_102_444_799] {
+            assert_eq!(rfc3339_to_unix(&unix_to_rfc3339(secs)), Some(secs));
+        }
+        for bad in [
+            "",
+            "2026-10-13T12:00:00",
+            "2026-10-13T12:00:00+07:00",
+            "2026-10-13 12:00:00Z",
+            "2026-10-13T12:00:00.5Z",
+            "2026-02-30T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-10-13T24:00:00Z",
+            "+026-10-13T12:00:00Z",
+        ] {
+            assert_eq!(rfc3339_to_unix(bad), None, "{bad:?}");
+        }
     }
 }

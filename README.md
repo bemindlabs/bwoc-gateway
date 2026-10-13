@@ -99,6 +99,35 @@ and pongs are rate-limited to one per second per claimed sender. With
 `gateway-pong.jsonl` beside it (`--pong-log` to move it). The envelope `sender`
 is a claim, not a proof, so a pong tells you the bridge is up — not who asked.
 
+#### Acting on mail without a live session
+
+`--on-message <program>` (off by default) runs a program for each message, with
+the message on its stdin. The gateway stays a relay — it runs your program and
+nothing else — and because this is remote input triggering local execution, the
+gate is the inner signature, never the envelope `sender`:
+
+```bash
+bwoc-gateway-recv ... \
+  --on-message /usr/local/bin/handle-mail \
+  --trust-key agent-busaba=<agent-busaba's signingPublicKey hex>
+```
+
+- Runs only for a `bwoc_signing` envelope that verifies against the key pinned
+  for its `from`, and whose signed `to` is this agent. At least one
+  `--trust-key` is required; repeat it per trusted sender.
+- The signed `ts` must be within `--on-message-max-age-secs` (default 300) of
+  now, and each `(from, messageId, nonce)` fires once. Mail parked longer than
+  that is delivered but does not fire the hook.
+- Executed directly, no shell; nothing from the message reaches argv. The
+  verified sender and id are in `BWOC_GATEWAY_FROM` / `BWOC_GATEWAY_MESSAGE_ID`.
+- At most 4 runs at once; each is killed after `--on-message-timeout-secs`
+  (default 60). The kill reaches the program, not processes it started.
+- Every message is written to the inbox first. A hook that fails, times out or
+  is skipped never loses mail.
+
+What the program does with a verified message is yours to bound: it runs with
+the bridge's privileges, on input a trusted peer chose.
+
 ## 📊 Status
 
 **v1.0.0 — stable.** Online relay-by-recipient with signed-challenge auth (the
