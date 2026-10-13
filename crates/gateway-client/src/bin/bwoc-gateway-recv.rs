@@ -25,19 +25,27 @@
 //! Usage (typically supervised by `bwoc-agent --serve`):
 //!   bwoc-gateway-recv --url <wss://gw/v1/connect> --agent-id <self> \
 //!                     --key-file <hex-seed> --inbox <.bwoc/inbox.jsonl> \
-//!                     [--auto-pong] [--pong-log <path>]
+//!                     [--auto-pong] [--pong-log <path>] \
+//!                     [--on-message <program> --trust-key <agent-id>=<pubkey-hex>...
+//!                      [--on-message-timeout-secs <n>] [--on-message-max-age-secs <n>]]
 //!
 //! `--auto-pong` (off by default) answers a `{"type":"ping"}` body with a pong
 //! from the bridge itself and keeps ping/pong out of the inbox; received pongs
 //! go to `--pong-log` (default: `gateway-pong.jsonl` beside the inbox).
 //!
+//! `--on-message` (off by default) runs a program for each message whose inner
+//! signature verifies against a `--trust-key` pinned for its sender; the message
+//! arrives on the program's stdin. See `gateway_client::bridge` for the rules.
+//!
 //! On stream end or any WebSocket error it exits non-zero so a supervisor can
 //! respawn it (respawn = reconnect).
 
+use std::collections::HashMap;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use gateway_client::bridge::{self, BridgeOptions};
+use gateway_client::bridge::{self, BridgeOptions, HookOptions};
 use gateway_client::{GatewayClient, GatewayConfig};
 
 #[tokio::main]
@@ -69,6 +77,15 @@ async fn run() -> Result<(), String> {
             ""
         }
     );
+    if let Some(hook) = &args.bridge.hook {
+        let mut trusted: Vec<&str> = hook.trust_keys.keys().map(String::as_str).collect();
+        trusted.sort_unstable();
+        eprintln!(
+            "bwoc-gateway-recv: on-message {} for signed mail from: {}",
+            hook.program.display(),
+            trusted.join(", ")
+        );
+    }
 
     bridge::run(&mut client, &args.bridge).await
 }
@@ -95,6 +112,8 @@ impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let (mut url, mut agent_id, mut key_file, mut inbox) = (None, None, None, None);
         let (mut auto_pong, mut pong_log) = (false, None);
+        let (mut on_message, mut trust_keys) = (None, HashMap::new());
+        let (mut hook_timeout, mut hook_max_age) = (None, None);
         let mut it = args;
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("missing value for {flag}"));
@@ -105,6 +124,19 @@ impl Args {
                 "--inbox" => inbox = Some(value()?),
                 "--auto-pong" => auto_pong = true,
                 "--pong-log" => pong_log = Some(value()?),
+                "--on-message" => on_message = Some(value()?),
+                "--trust-key" => {
+                    let (id, key) = bridge::parse_trust_key(&value()?)?;
+                    if trust_keys.insert(id.clone(), key).is_some() {
+                        return Err(format!("--trust-key given twice for {id}"));
+                    }
+                }
+                "--on-message-timeout-secs" => {
+                    hook_timeout = Some(positive_secs(&flag, &value()?)?)
+                }
+                "--on-message-max-age-secs" => {
+                    hook_max_age = Some(positive_secs(&flag, &value()?)?)
+                }
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -116,12 +148,41 @@ impl Args {
             }
             bridge.pong_log = p.into();
         }
+        match on_message {
+            Some(program) => {
+                // Without a pinned key nothing could ever verify, and running
+                // the hook on unverified mail is exactly what this must not do.
+                if trust_keys.is_empty() {
+                    return Err("--on-message needs at least one --trust-key".into());
+                }
+                bridge.hook = Some(HookOptions {
+                    program: program.into(),
+                    trust_keys,
+                    timeout: hook_timeout.unwrap_or(bridge::DEFAULT_HOOK_TIMEOUT),
+                    max_age: hook_max_age.unwrap_or(bridge::DEFAULT_HOOK_MAX_AGE),
+                });
+            }
+            None => {
+                if !trust_keys.is_empty() || hook_timeout.is_some() || hook_max_age.is_some() {
+                    return Err("--trust-key / --on-message-* need --on-message".into());
+                }
+            }
+        }
         Ok(Self {
             url: url.ok_or("missing --url")?,
             agent_id: agent_id.ok_or("missing --agent-id")?,
             key_file: key_file.ok_or("missing --key-file")?,
             bridge,
         })
+    }
+}
+
+/// A whole number of seconds, at least 1. Zero is refused rather than read as
+/// "no limit": both flags bound something that must stay bounded.
+fn positive_secs(flag: &str, raw: &str) -> Result<Duration, String> {
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Ok(Duration::from_secs(n)),
+        _ => Err(format!("{flag} must be a whole number of seconds ≥ 1")),
     }
 }
 
@@ -157,6 +218,73 @@ mod tests {
         assert_eq!(a.bridge.pong_log, Path::new("/w/.bwoc/gateway-pong.jsonl"));
         let a = parse(&["--auto-pong", "--pong-log", "/tmp/p.jsonl"]).unwrap();
         assert_eq!(a.bridge.pong_log, Path::new("/tmp/p.jsonl"));
+    }
+
+    const KEY: &str =
+        "agent-alpha=ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+
+    #[test]
+    fn the_hook_is_off_unless_asked_for() {
+        assert!(parse(&[]).unwrap().bridge.hook.is_none());
+    }
+
+    #[test]
+    fn the_hook_needs_a_pinned_key() {
+        let err = parse(&["--on-message", "/bin/true"]).unwrap_err();
+        assert!(err.contains("--trust-key"), "{err}");
+        let hook = parse(&["--on-message", "/bin/true", "--trust-key", KEY])
+            .unwrap()
+            .bridge
+            .hook
+            .unwrap();
+        assert_eq!(hook.program, Path::new("/bin/true"));
+        assert!(hook.trust_keys.contains_key("agent-alpha"));
+        assert_eq!(hook.timeout, gateway_client::bridge::DEFAULT_HOOK_TIMEOUT);
+        assert_eq!(hook.max_age, gateway_client::bridge::DEFAULT_HOOK_MAX_AGE);
+    }
+
+    #[test]
+    fn hook_flags_without_the_hook_are_usage_errors() {
+        assert!(parse(&["--trust-key", KEY]).is_err());
+        assert!(parse(&["--on-message-timeout-secs", "5"]).is_err());
+    }
+
+    #[test]
+    fn hook_limits_must_be_positive_whole_seconds() {
+        let with = |flag: &str, v: &str| {
+            parse(&["--on-message", "/bin/true", "--trust-key", KEY, flag, v])
+        };
+        for flag in ["--on-message-timeout-secs", "--on-message-max-age-secs"] {
+            assert!(with(flag, "0").is_err(), "{flag} 0 must not mean unlimited");
+            assert!(with(flag, "-1").is_err());
+            assert!(with(flag, "soon").is_err());
+        }
+        let hook = with("--on-message-timeout-secs", "5")
+            .unwrap()
+            .bridge
+            .hook
+            .unwrap();
+        assert_eq!(hook.timeout, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_repeated_or_malformed_trust_key_is_refused() {
+        assert!(parse(&[
+            "--on-message",
+            "/bin/true",
+            "--trust-key",
+            KEY,
+            "--trust-key",
+            KEY
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--on-message",
+            "/bin/true",
+            "--trust-key",
+            "agent-alpha=abcd"
+        ])
+        .is_err());
     }
 
     #[test]

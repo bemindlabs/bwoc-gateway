@@ -28,6 +28,7 @@ gateway เป็นพื้นผิว **untrusted-ingress** บนอิน�
 - **ไม่เชื่อ payload** gateway route ตาม header `recipient` ที่เป็น cleartext เท่านั้น ไม่ตีความหรือรับรอง body (การเข้ารหัส body แบบ E2E — ให้ relay อ่าน payload ไม่ได้ด้วยซ้ำ — มีให้ใช้แล้วใน `gateway-client::crypto`)
 - **`sender` เป็นแค่คำอ้าง** relay พิสูจน์ได้ว่า connection ถือ key ที่ยื่นมา แต่ไม่ได้ผูก `agent_id` กับ key และไม่ได้เทียบ `sender` ของ envelope กับ connection มีแต่ลายเซ็นชั้นในเท่านั้นที่ระบุตัวผู้ส่งได้
 - **Auto-pong เป็น opt-in และแคบ** `bwoc-gateway-recv --auto-pong` ตอบ `{"type":"ping"}` ด้วย pong รูปแบบตายตัว ไม่ตอบ pong และจำกัดอัตราต่อ sender ที่อ้างมา ไม่รันคำสั่งใด ๆ และไม่เขียน ping/pong ลง inbox
+- **on-message hook ผ่านด่านด้วยลายเซ็นชั้นใน** `bwoc-gateway-recv --on-message <program>` (opt-in) รันโปรแกรมต่อข้อความก็ต่อเมื่อลายเซ็น `bwoc_signing` verify ผ่านกับ key ที่ operator ปักหมุดไว้ด้วย `--trust-key`, `to` ที่ลงนามคือ agent นี้, `ts` ที่ลงนามยังสด และไม่เคยเห็น envelope นี้มาก่อน โปรแกรมถูกรันตรง ๆ โดยรับข้อความทาง stdin มีขอบเขตทั้งจำนวนที่รันพร้อมกันและเวลา gateway ยังคงไม่มี task logic ของตัวเอง
 - **การควบคุมที่ขอบ** TLS, rate limit ต่อ agent, queue มีขอบเขต การอนุญาตแบบ capability/Kalyāṇamitta-7 ยังอยู่ที่ harness ฝั่งผู้รับ — gateway ไม่เคยยกระดับ trust
 
 ## โรดแมป

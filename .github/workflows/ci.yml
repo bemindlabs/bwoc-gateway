@@ -4,6 +4,10 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only: this workflow builds and tests, it never writes to the repo.
+permissions:
+  contents: read
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
