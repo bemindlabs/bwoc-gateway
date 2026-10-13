@@ -6,6 +6,7 @@ All notable changes to `bwoc-gateway` are documented here. The format is based o
 
 ### Fixed
 
+- **`ClientError::Ws` now boxes the WebSocket error.** A newer stable clippy (`result_large_err`) rejects the ~136-byte variant, which had turned CI red for every change to `gateway-client`. `?` on a tungstenite error still converts; code that pattern-matches `ClientError::Ws(e)` now gets a `Box`.
 - **Docs claimed `Envelope.sender` was authenticated; it is not.** `bwoc-gateway-recv` and the 1.0 notes described the relay-reported `sender` as "ed25519-authenticated". The relay verifies that a connection holds the key it presented, but it does not pin an `agent_id` to a key and does not compare an envelope's `sender` with the connection that sent it. The comments and overview now say so: `sender` is a claim, and only the inner signature identifies a sender. No behaviour change.
 - **Resource broker hardening** (Copilot review of the broker PR). Three fixes: `discover` no longer holds the registry mutex across its `O(n log n)` sort (the lock scope now ends before the sort, so it can't block a concurrent advertise/discover or pin a Tokio worker); `snapshot_cpu_cores` clamps `u64 → u32` instead of `as`-truncating (an untrusted snapshot's absurd core count can no longer wrap small and spuriously pass a `min_cpu_cores` filter); and the registry gained a hard `MAX_OFFERS` count cap (soonest-expiry eviction) so a flood of distinct `provider` ids can't grow the in-memory map without bound — TTL bounds time, this bounds count. 2 new tests.
 

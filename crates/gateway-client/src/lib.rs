@@ -120,8 +120,10 @@ impl GatewayConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
+    /// Boxed: the tungstenite error is ~136 bytes and would otherwise make
+    /// every `Result<_, ClientError>` that large (`clippy::result_large_err`).
     #[error("websocket: {0}")]
-    Ws(#[from] tokio_tungstenite::tungstenite::Error),
+    Ws(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("handshake: {0}")]
@@ -134,6 +136,12 @@ pub enum ClientError {
     /// blocking forever) is what lets the supervisor respawn us and reconnect.
     #[error("read timeout: no frame from the relay in {0:?}; connection is half-open")]
     ReadTimeout(Duration),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::Ws(Box::new(e))
+    }
 }
 
 // ---- wire types (mirror gateway-server/src/wire.rs) ----------------------
