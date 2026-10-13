@@ -790,13 +790,16 @@ mod tests {
 
     #[test]
     fn canonical_bytes_match_the_frameworks() {
+        // Fields come from the fixture so the vector is written down once.
+        let body = vec_body();
+        let f = |k: &str| body[k].as_str().unwrap();
         let got = canonical_bytes(
-            "agent-alpha",
-            "agent-beta",
-            VEC_TS,
-            "msg-20261013T120000Z-ab123",
-            "deploy \"now\" — ไทย\n",
-            "00112233445566778899aabbccddeeff",
+            f("from"),
+            f("to"),
+            f("ts"),
+            f("messageId"),
+            f("message"),
+            f("nonce"),
         );
         assert_eq!(
             String::from_utf8(got).unwrap(),
