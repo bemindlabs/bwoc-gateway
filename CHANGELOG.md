@@ -4,6 +4,8 @@ All notable changes to `bwoc-gateway` are documented here. The format is based o
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-14
+
 ### Fixed
 
 - **`ClientError::Ws` now boxes the WebSocket error.** A newer stable clippy (`result_large_err`) rejects the ~136-byte variant, which had turned CI red for every change to `gateway-client`. `?` on a tungstenite error still converts; code that pattern-matches `ClientError::Ws(e)` now gets a `Box`.
@@ -57,6 +59,7 @@ First **stable** release — the wire protocol and the `gateway-client` API are 
 - Bilingual design docs under `docs/{en,th}/`.
 - `deploy/` Dockerfile (+ compose) for the long-running service.
 
-[Unreleased]: https://github.com/bemindlabs/bwoc-gateway/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/bemindlabs/bwoc-gateway/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/bemindlabs/bwoc-gateway/compare/v1.0.1...v1.1.0
 [1.0.0]: https://github.com/bemindlabs/bwoc-gateway/releases/tag/v1.0.0
 [0.1.0]: https://github.com/bemindlabs/bwoc-gateway/releases/tag/v0.1.0

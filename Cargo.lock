@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-client"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "crypto_box",
  "curve25519-dalek",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-server"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "axum",
  "ed25519-dalek",
