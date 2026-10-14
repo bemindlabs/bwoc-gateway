@@ -7,9 +7,9 @@
 [![CI](https://github.com/bemindlabs/bwoc-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/bemindlabs/bwoc-gateway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
 [![Docs](https://img.shields.io/badge/docs-EN%20%7C%20TH-blue.svg)](docs/)
-[![Status](https://img.shields.io/badge/status-v1.1.0%20stable-brightgreen.svg)](#-status)
+[![Status](https://img.shields.io/badge/status-v1.2.0%20stable-brightgreen.svg)](#-status)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 </div>
@@ -133,7 +133,7 @@ the bridge's privileges, on input a trusted peer chose.
 
 ## 📊 Status
 
-**v1.1.0 — stable.** Online relay-by-recipient with signed-challenge auth (the
+**v1.2.0 — stable.** Online relay-by-recipient with signed-challenge auth (the
 keypair is the login), **durable store-and-forward** for offline recipients,
 **multi-gateway federation** (loop-safe single-hop peer forwarding), and a real
 WebSocket **client + end-to-end body encryption** (ed25519→x25519 sealed box).
