@@ -4,6 +4,8 @@ All notable changes to `bwoc-gateway` are documented here. The format is based o
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-14
+
 ### Added
 
 - **Optional federation peer token.** `BWOC_GATEWAY_FEDERATE_TOKEN`, when set, must be sent as `Authorization: Bearer <token>` on `POST /v1/federate` (401 otherwise) and is attached to this node's own calls to its peers. Unset keeps the previous open behaviour. Federation ingress also stops waiting after 2 s for room in a full recipient queue and answers `delivered: false`, so the peer parks the envelope.
@@ -71,7 +73,8 @@ First **stable** release — the wire protocol and the `gateway-client` API are 
 - Bilingual design docs under `docs/{en,th}/`.
 - `deploy/` Dockerfile (+ compose) for the long-running service.
 
-[Unreleased]: https://github.com/bemindlabs/bwoc-gateway/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/bemindlabs/bwoc-gateway/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/bemindlabs/bwoc-gateway/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bemindlabs/bwoc-gateway/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bemindlabs/bwoc-gateway/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bemindlabs/bwoc-gateway/releases/tag/v1.0.0
