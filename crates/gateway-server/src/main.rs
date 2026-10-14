@@ -30,7 +30,8 @@ use axum::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
-    response::IntoResponse,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -96,15 +97,29 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+/// How long federation ingress waits for room in a local recipient's queue.
+/// Kept under the peer's 5 s HTTP timeout so a full queue answers `delivered:
+/// false` (the peer then parks it) instead of tying up the request.
+const FEDERATE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Federation ingress: deliver `env` only if its recipient is connected *here*.
-/// Loop-safe by construction — this handler never forwards onward.
+/// Loop-safe by construction — this handler never forwards onward. Gated by the
+/// optional shared peer token (see `federation`).
 async fn federate(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(env): Json<Envelope>,
-) -> Json<FederateResult> {
-    let delivered = state.presence.route(&env).await;
+) -> Response {
+    let auth = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    if !state.federation.ingress_allowed(auth) {
+        tracing::warn!("federation ingress refused: missing or wrong peer token");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let delivered = tokio::time::timeout(FEDERATE_DELIVERY_TIMEOUT, state.presence.route(&env))
+        .await
+        .unwrap_or(false);
     tracing::info!(recipient = %env.recipient, delivered, "federation ingress");
-    Json(FederateResult { delivered })
+    Json(FederateResult { delivered }).into_response()
 }
 
 /// One connection: signed-challenge auth → register presence → drain parked

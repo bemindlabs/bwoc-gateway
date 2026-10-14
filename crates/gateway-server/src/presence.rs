@@ -36,7 +36,9 @@ impl Presence {
     ///
     /// [`unregister`]: Presence::unregister
     pub async fn register(&self, agent_id: String, tx: mpsc::Sender<Envelope>) -> u64 {
-        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        // Tokens start at 1: `0` is reserved for "never registered" (a pure
+        // sender in `main.rs`), so no real registration can be mistaken for it.
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed) + 1;
         let prev = self
             .connections
             .lock()
@@ -132,6 +134,10 @@ mod tests {
         let t1 = p.register("agent-b".into(), tx1).await; // conn #1
         let t2 = p.register("agent-b".into(), tx2).await; // conn #2 takes the slot
         assert_ne!(t1, t2, "tokens must be unique");
+        assert!(
+            t1 != 0 && t2 != 0,
+            "0 is reserved for an unregistered sender"
+        );
 
         // Conn #1 tears down late and unregisters with ITS (stale) token.
         p.unregister("agent-b", t1).await;

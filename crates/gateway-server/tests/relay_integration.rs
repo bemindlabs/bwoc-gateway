@@ -33,13 +33,16 @@ impl Drop for Server {
     }
 }
 
+/// Ready = `/healthz` answers `ok`. A bare TCP connect could succeed against
+/// some other process that grabbed the port in the `free_port` race.
 async fn wait_ready(port: u16) {
+    let url = format!("http://127.0.0.1:{port}/healthz");
+    let http = reqwest::Client::new();
     for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return;
+        if let Ok(resp) = http.get(&url).send().await {
+            if resp.status().is_success() && resp.text().await.is_ok_and(|b| b == "ok") {
+                return;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -83,14 +86,14 @@ fn msg(to: &str, from: &str, marker: &str) -> Envelope {
 async fn relay_crypto_and_store_and_forward() {
     let port = free_port();
     let store = std::env::temp_dir().join(format!("bwoc-gw-it-{}-{port}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&store);
+    let _ = tokio::fs::remove_dir_all(&store).await;
 
     let child = Command::new(env!("CARGO_BIN_EXE_bwoc-gateway"))
         .env("BWOC_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
         .env("BWOC_GATEWAY_STORE_DIR", &store)
         .spawn()
         .expect("spawn bwoc-gateway");
-    let _server = Server { child };
+    let server = Server { child };
     wait_ready(port).await;
     let url = format!("ws://127.0.0.1:{port}/v1/connect");
 
@@ -145,7 +148,9 @@ async fn relay_crypto_and_store_and_forward() {
         "agent-c must drain its parked mail"
     );
 
-    let _ = std::fs::remove_dir_all(&store);
+    // Stop the server before deleting its store dir (it may hold files open).
+    drop(server);
+    let _ = tokio::fs::remove_dir_all(&store).await;
 }
 
 /// Delivery receipts (delivered vs parked) and the presence self-collision fix:
@@ -222,7 +227,7 @@ async fn receipts_and_sender_does_not_evict_receiver() {
 async fn heartbeat_does_not_evict_a_live_receiver() {
     let port = free_port();
     let store = std::env::temp_dir().join(format!("bwoc-gw-hb-{}-{port}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&store);
+    let _ = tokio::fs::remove_dir_all(&store).await;
 
     let child = Command::new(env!("CARGO_BIN_EXE_bwoc-gateway"))
         .env("BWOC_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
@@ -231,7 +236,7 @@ async fn heartbeat_does_not_evict_a_live_receiver() {
         .env("BWOC_GATEWAY_HEARTBEAT_SECS", "0.2")
         .spawn()
         .expect("spawn bwoc-gateway");
-    let _server = Server { child };
+    let server = Server { child };
     wait_ready(port).await;
     let url = format!("ws://127.0.0.1:{port}/v1/connect");
 
@@ -279,5 +284,46 @@ async fn heartbeat_does_not_evict_a_live_receiver() {
     assert_eq!(got, "alive");
 
     reader.abort();
-    let _ = std::fs::remove_dir_all(&store);
+    drop(server);
+    let _ = tokio::fs::remove_dir_all(&store).await;
+}
+
+/// With `BWOC_GATEWAY_FEDERATE_TOKEN` set, `/v1/federate` refuses a request
+/// without the shared peer token and accepts one that carries it.
+#[tokio::test]
+async fn federate_requires_the_peer_token_when_configured() {
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_bwoc-gateway"))
+        .env("BWOC_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
+        .env("BWOC_GATEWAY_FEDERATE_TOKEN", "peer-secret")
+        .spawn()
+        .expect("spawn bwoc-gateway");
+    let _server = Server { child };
+    wait_ready(port).await;
+
+    let url = format!("http://127.0.0.1:{port}/v1/federate");
+    let http = reqwest::Client::new();
+    let env = msg("agent-nobody", "agent-x", "fed");
+
+    let open = http.post(&url).json(&env).send().await.unwrap();
+    assert_eq!(open.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let wrong = http
+        .post(&url)
+        .bearer_auth("nope")
+        .json(&env)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let ok = http
+        .post(&url)
+        .bearer_auth("peer-secret")
+        .json(&env)
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success());
+    let body: serde_json::Value = ok.json().await.unwrap();
+    assert_eq!(body["delivered"], false, "recipient is not connected here");
 }
