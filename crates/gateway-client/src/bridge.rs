@@ -320,8 +320,8 @@ async fn handle(
     // Stamp the relay-reported sender id + a receive timestamp into the
     // persisted envelope so the recipient's tooling always has a `from`/`ts`
     // instead of `?`. Absent-only: a properly signed inner envelope already
-    // carries `from`/`ts` as part of its signed payload, so we must NOT
-    // overwrite them (that would invalidate the signature).
+    // carries `from`/`ts` (strings) as part of its signed payload, so we must
+    // NOT overwrite them (that would invalidate the signature).
     let body = stamp_provenance(env.body, &env.sender, &now_rfc3339());
     append_jsonl(&opts.inbox, &body)?;
 
@@ -511,11 +511,13 @@ fn spawn_hook(
 
 /// Fill in `from` (= the relay-reported `sender`, a claim — see the module
 /// docs) and `ts` (= receive time) on
-/// the persisted envelope **only when absent**. A properly signed inner envelope
+/// the persisted envelope **only when absent or not a string**. A properly signed inner envelope
 /// already carries both inside its signed payload, so leaving present fields
 /// untouched keeps the recipient's signature verification valid; a raw body that
 /// lacks them gets an attribution + timestamp instead of rendering as
-/// `?`. A non-object body is wrapped as `{from, ts, message: <body>}` so it is
+/// `?`. A non-string `from`/`ts` is replaced too: it is not a valid
+/// `bwoc_signing` field (those are strings), so it could not be part of a
+/// verifiable signature and would otherwise still render as `?`. A non-object body is wrapped as `{from, ts, message: <body>}` so it is
 /// still attributable. `from`/`ts` are not overwritten even if the body claims
 /// its own (the recipient's trust gate is the authority on a claimed identity).
 fn stamp_provenance(body: Value, sender: &str, ts: &str) -> Value {
@@ -671,6 +673,7 @@ mod tests {
     fn wraps_a_non_object_body() {
         let out = stamp_provenance(json!("plain string"), "agent-x", "2026-06-21T00:00:00Z");
         assert_eq!(out["from"], "agent-x");
+        assert_eq!(out["ts"], "2026-06-21T00:00:00Z");
         assert_eq!(out["message"], "plain string");
     }
 

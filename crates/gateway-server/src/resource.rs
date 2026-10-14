@@ -95,9 +95,9 @@ impl ResourceRegistry {
     /// Return the live offers matching `query`, best-fit first (most free VRAM,
     /// then most free RAM). Evicts expired entries as a side effect.
     pub fn discover(&self, query: &DiscoverQuery, now: Instant) -> Vec<Offer> {
-        // Scope the lock to the collect — the (potentially O(n log n)) sort runs
-        // after the guard drops, so it never blocks a concurrent advertise/
-        // discover (nor pins a Tokio worker thread on the mutex).
+        // Scope the lock to evict + filter + collect — the (potentially
+        // O(n log n)) sort runs after the guard drops, so the sort itself does
+        // not extend the time a concurrent advertise/discover waits on the mutex.
         let mut out: Vec<Offer> = {
             let mut map = self.offers.lock().expect("registry lock");
             evict_expired(&mut map, now);

@@ -27,9 +27,26 @@ use tokio::sync::Mutex;
 /// surfaced upstream — the relay refuses to be an unbounded spool).
 const MAX_PER_RECIPIENT: usize = 1024;
 
+/// The on-disk log is append-only, so evicted envelopes stay in it until it is
+/// compacted. Once a recipient's log reaches this many lines it is rewritten
+/// from the in-memory queue, so a recipient that never reconnects cannot grow
+/// its file without bound (at most `2 × MAX_PER_RECIPIENT` lines on disk).
+const MAX_LOG_LINES: usize = 2 * MAX_PER_RECIPIENT;
+
+/// One offline recipient's parked mail plus how many lines its log holds.
+#[derive(Default)]
+struct Queue {
+    items: Vec<Envelope>,
+    disk_lines: usize,
+}
+
 /// Store-and-forward queue, optionally file-backed for durability.
+///
+/// Disk writes happen under the queue lock on purpose: memory and log must not
+/// diverge (a `park` racing a `drain` could otherwise re-create a log of mail
+/// that was already delivered, and replay it after a restart).
 pub struct Store {
-    queues: Mutex<HashMap<String, Vec<Envelope>>>,
+    queues: Mutex<HashMap<String, Queue>>,
     dir: Option<PathBuf>,
 }
 
@@ -81,15 +98,24 @@ impl Store {
     pub async fn park(&self, env: Envelope) {
         let mut queues = self.queues.lock().await;
         let q = queues.entry(env.recipient.clone()).or_default();
-        if q.len() >= MAX_PER_RECIPIENT {
-            q.remove(0); // evict oldest
+        if q.items.len() >= MAX_PER_RECIPIENT {
+            q.items.remove(0); // evict oldest
         }
-        q.push(env.clone());
+        q.items.push(env.clone());
         if let Some(dir) = &self.dir {
             // Best-effort durability; a write failure degrades to in-memory for
             // this item rather than dropping the live relay.
-            if let Err(e) = Self::append_line(dir, &env).await {
-                tracing::warn!(error = %e, recipient = %env.recipient, "store append failed");
+            let written = if q.disk_lines >= MAX_LOG_LINES {
+                Self::rewrite_log(dir, &env.recipient, &q.items)
+                    .await
+                    .map(|()| q.disk_lines = q.items.len())
+            } else {
+                Self::append_line(dir, &env)
+                    .await
+                    .map(|()| q.disk_lines += 1)
+            };
+            if let Err(e) = written {
+                tracing::warn!(error = %e, recipient = %env.recipient, "store write failed");
             }
         }
     }
@@ -100,7 +126,7 @@ impl Store {
     pub async fn drain(&self, recipient: &str) -> Vec<Envelope> {
         let taken = {
             let mut queues = self.queues.lock().await;
-            queues.remove(recipient).unwrap_or_default()
+            queues.remove(recipient).unwrap_or_default().items
         };
         if let Some(dir) = &self.dir {
             let _ = tokio::fs::remove_file(Self::log_path(dir, recipient)).await;
@@ -114,7 +140,7 @@ impl Store {
             .lock()
             .await
             .get(recipient)
-            .map(|q| q.len())
+            .map(|q| q.items.len())
             .unwrap_or(0)
     }
 
@@ -137,8 +163,24 @@ impl Store {
         f.write_all(line.as_bytes()).await
     }
 
-    async fn replay(dir: &Path) -> std::io::Result<HashMap<String, Vec<Envelope>>> {
-        let mut queues: HashMap<String, Vec<Envelope>> = HashMap::new();
+    /// Replace a recipient's log with exactly `items` (compaction). Written to a
+    /// sibling temp file and renamed over the log, so a crash mid-write leaves
+    /// the old log intact rather than a truncated one. The temp name does not
+    /// end in `.jsonl`, so `replay` never reads it.
+    async fn rewrite_log(dir: &Path, recipient: &str, items: &[Envelope]) -> std::io::Result<()> {
+        let mut buf = String::new();
+        for env in items {
+            buf.push_str(&serde_json::to_string(env)?);
+            buf.push('\n');
+        }
+        let path = Self::log_path(dir, recipient);
+        let tmp = path.with_extension("jsonl.tmp");
+        tokio::fs::write(&tmp, buf).await?;
+        tokio::fs::rename(&tmp, &path).await
+    }
+
+    async fn replay(dir: &Path) -> std::io::Result<HashMap<String, Queue>> {
+        let mut queues: HashMap<String, Queue> = HashMap::new();
         let mut entries = tokio::fs::read_dir(dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -149,10 +191,14 @@ impl Store {
             for line in content.lines().filter(|l| !l.trim().is_empty()) {
                 match serde_json::from_str::<Envelope>(line) {
                     Ok(env) => {
+                        // Keep the most recent `MAX_PER_RECIPIENT`, the same
+                        // drop-oldest policy `park` applies at runtime.
                         let q = queues.entry(env.recipient.clone()).or_default();
-                        if q.len() < MAX_PER_RECIPIENT {
-                            q.push(env);
+                        q.disk_lines += 1;
+                        if q.items.len() >= MAX_PER_RECIPIENT {
+                            q.items.remove(0);
                         }
+                        q.items.push(env);
                     }
                     Err(e) => tracing::warn!(error = %e, ?path, "skipping corrupt store line"),
                 }
@@ -221,6 +267,39 @@ mod tests {
         // drain removed the log → a third open sees nothing
         let s3 = Store::file_backed(&dir).await.unwrap();
         assert!(s3.drain("agent-b").await.is_empty());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A recipient that stays offline past the cap: replay must keep the newest
+    /// envelopes (as `park` does), and the log must be compacted rather than
+    /// growing with every evicted envelope.
+    #[tokio::test]
+    async fn file_backing_keeps_newest_and_bounds_the_log() {
+        let dir = std::env::temp_dir().join(format!("bwoc-gw-cap-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let total = 3 * MAX_PER_RECIPIENT as u64;
+        {
+            let s = Store::file_backed(&dir).await.unwrap();
+            for i in 0..total {
+                s.park(env("agent-b", i)).await;
+            }
+        }
+        let log = tokio::fs::read_to_string(Store::log_path(&dir, "agent-b"))
+            .await
+            .unwrap();
+        assert!(
+            log.lines().count() <= MAX_LOG_LINES,
+            "log grew to {} lines",
+            log.lines().count()
+        );
+        let s2 = Store::file_backed(&dir).await.unwrap();
+        let drained = s2.drain("agent-b").await;
+        assert_eq!(drained.len(), MAX_PER_RECIPIENT);
+        assert_eq!(
+            drained[0].body,
+            json!({ "seq": total - MAX_PER_RECIPIENT as u64 })
+        );
+        assert_eq!(drained.last().unwrap().body, json!({ "seq": total - 1 }));
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

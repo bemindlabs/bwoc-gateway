@@ -13,6 +13,13 @@
 //! Federation does not change the trust model: peers exchange the same opaque,
 //! end-to-end-signed envelopes. A malicious peer can drop or misreport delivery
 //! but cannot forge a `sender` or read an (encrypted) `body`.
+//!
+//! **Optional peer secret.** `BWOC_GATEWAY_FEDERATE_TOKEN`, when set, must be
+//! presented as `Authorization: Bearer <token>` on `POST /v1/federate`, and is
+//! attached to this node's own outbound federation calls — so all peers in a
+//! mesh share one value. It only fences the gateway-to-gateway door against
+//! random internet traffic; it is not an identity and confers no trust on the
+//! envelopes (those stay end-to-end signed and verified by the recipient).
 
 use crate::wire::Envelope;
 use serde::{Deserialize, Serialize};
@@ -29,6 +36,8 @@ pub struct FederateResult {
 pub struct Federation {
     peers: Vec<String>,
     http: reqwest::Client,
+    /// Shared peer secret (`BWOC_GATEWAY_FEDERATE_TOKEN`); `None` = open door.
+    token: Option<String>,
 }
 
 impl Federation {
@@ -43,13 +52,32 @@ impl Federation {
         } else {
             tracing::info!(count = peers.len(), "federation: enabled");
         }
+        let token = std::env::var("BWOC_GATEWAY_FEDERATE_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        if token.is_some() {
+            tracing::info!("federation: /v1/federate requires the shared peer token");
+        }
         Self {
             peers,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("build federation http client"),
+            token,
         }
+    }
+
+    /// Whether a `/v1/federate` request may proceed: always when no token is
+    /// configured, otherwise only with `Authorization: Bearer <token>`
+    /// (compared in constant time).
+    pub fn ingress_allowed(&self, authorization: Option<&str>) -> bool {
+        let Some(expected) = &self.token else {
+            return true;
+        };
+        authorization
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .is_some_and(|got| ct_eq(got.as_bytes(), expected.as_bytes()))
     }
 
     fn parse_peers(raw: &str) -> Vec<String> {
@@ -65,7 +93,11 @@ impl Federation {
     pub async fn forward(&self, env: &Envelope) -> bool {
         for peer in &self.peers {
             let url = format!("{peer}/v1/federate");
-            match self.http.post(&url).json(env).send().await {
+            let mut req = self.http.post(&url).json(env);
+            if let Some(token) = &self.token {
+                req = req.bearer_auth(token);
+            }
+            match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<FederateResult>().await {
                         Ok(r) if r.delivered => return true,
@@ -81,9 +113,38 @@ impl Federation {
     }
 }
 
+/// Constant-time byte comparison (length is not secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fed(token: Option<&str>) -> Federation {
+        Federation {
+            peers: vec![],
+            http: reqwest::Client::new(),
+            token: token.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn ingress_is_open_without_a_token() {
+        assert!(fed(None).ingress_allowed(None));
+        assert!(fed(None).ingress_allowed(Some("Bearer anything")));
+    }
+
+    #[test]
+    fn ingress_requires_the_exact_bearer_token_when_set() {
+        let f = fed(Some("s3cret"));
+        assert!(f.ingress_allowed(Some("Bearer s3cret")));
+        assert!(!f.ingress_allowed(None));
+        assert!(!f.ingress_allowed(Some("Bearer wrong")));
+        assert!(!f.ingress_allowed(Some("Bearer s3cret2")));
+        assert!(!f.ingress_allowed(Some("s3cret")));
+    }
 
     #[test]
     fn parses_and_normalizes_peer_list() {
@@ -98,10 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_with_no_peers_is_false() {
-        let f = Federation {
-            peers: vec![],
-            http: reqwest::Client::new(),
-        };
+        let f = fed(None);
         let env = Envelope {
             recipient: "agent-x".into(),
             sender: "agent-y".into(),

@@ -36,9 +36,10 @@ client ──WS──▶ /v1/connect
 gateway ──HTTP──▶ POST /v1/federate { Envelope }      # peer-to-peer (federation)
   ◀ { delivered: bool }                               # delivered to a *local* agent? (never re-forwards)
 
-provider ─HTTP─▶ POST /v1/resource/advertise { snapshot, kinds, ttl }   # publish a live offer
-consumer ─HTTP─▶ POST /v1/resource/discover { kind, min spec }          # find matching offers
-  ◀ [ offers ]                                        # best-free-VRAM first, TTL-evicted registry
+provider ─HTTP─▶ POST /v1/resource/advertise { provider, snapshot, kinds, ttl_secs }   # publish a live offer
+  ◀ { ok, offer_id, live_offers }
+consumer ─HTTP─▶ POST /v1/resource/discover { kind, min_vram_mb?, min_ram_mb?, min_cpu_cores? }
+  ◀ { ok, offers: [ { provider, kinds, snapshot } ] }  # best-free-VRAM first, TTL-evicted registry
 ```
 
 The keypair **is** the login — no passwords, no server-side accounts. Delivery
@@ -69,6 +70,7 @@ Optional environment:
 ```bash
 BWOC_GATEWAY_STORE_DIR=/var/lib/bwoc-gateway   # durable store-and-forward (default: in-memory)
 BWOC_GATEWAY_PEERS=https://gw-eu.example,https://gw-us.example   # federation peers (default: none)
+BWOC_GATEWAY_FEDERATE_TOKEN=<shared secret>   # optional: /v1/federate requires `Authorization: Bearer <it>`; sent to peers too (same value mesh-wide)
 ```
 
 ### Receive bridge

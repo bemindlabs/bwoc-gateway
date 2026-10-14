@@ -4,6 +4,15 @@ All notable changes to `bwoc-gateway` are documented here. The format is based o
 
 ## [Unreleased]
 
+### Added
+
+- **Optional federation peer token.** `BWOC_GATEWAY_FEDERATE_TOKEN`, when set, must be sent as `Authorization: Bearer <token>` on `POST /v1/federate` (401 otherwise) and is attached to this node's own calls to its peers. Unset keeps the previous open behaviour. Federation ingress also stops waiting after 2 s for room in a full recipient queue and answers `delivered: false`, so the peer parks the envelope.
+
+### Fixed
+
+- **File-backed store: replay kept the oldest envelopes and the log grew without bound.** Replay now keeps the newest `MAX_PER_RECIPIENT` (the same drop-oldest policy as at runtime), and a recipient's log is compacted from memory once it reaches twice the cap.
+- Presence tokens start at 1, so `0` stays reserved for a never-registered sender. Docs: README resource-broker shapes now match the real JSON; `stamp_provenance` docs say it also replaces a non-string `from`/`ts`.
+
 ## [1.1.0] - 2026-10-14
 
 ### Added
