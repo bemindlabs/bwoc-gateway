@@ -1,0 +1,84 @@
+name: Release
+
+# A release is a portable gateway bundle, rather than a source-only tag.  The
+# relay plus both client commands must be installed together: agents use
+# `bwoc-gateway-send` to publish an envelope and `bwoc-gateway-recv` to keep a
+# receive bridge open.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_HTTP_MULTIPLEXING: false
+  CARGO_NET_RETRY: 10
+
+jobs:
+  create-release:
+    name: create release shell
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or reuse the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF##refs/tags/}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; reusing it for this run."
+          else
+            gh release create "$tag" --title "$tag" --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF##refs/tags/}"
+          name="bwoc-gateway-${tag}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          for binary in bwoc-gateway bwoc-gateway-send bwoc-gateway-recv; do
+            source="target/${{ matrix.target }}/release/${binary}"
+            test -f "$source" || { echo "::error::$binary was not built"; exit 1; }
+            cp "$source" "dist/${name}/"
+          done
+          cp README.md LICENSE CHANGELOG.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          shasum -a 256 "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF##refs/tags/}"
+          gh release upload "$tag" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber --repo "$GITHUB_REPOSITORY"

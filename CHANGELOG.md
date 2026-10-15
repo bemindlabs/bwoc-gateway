@@ -4,6 +4,14 @@ All notable changes to `bwoc-gateway` are documented here. The format is based o
 
 ## [Unreleased]
 
+### Added
+
+- **Portable GitHub Release bundles.** Pushing a `v*` tag now builds and
+  attaches checksummed archives for Linux x86_64/ARM64 and macOS
+  Intel/Apple Silicon. Each archive contains the relay plus both client
+  commands (`bwoc-gateway`, `bwoc-gateway-send`, and `bwoc-gateway-recv`), so
+  an installation no longer needs a local Rust source build (#24).
+
 ## [1.2.0] - 2026-10-14
 
 ### Added

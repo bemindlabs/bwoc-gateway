@@ -65,6 +65,23 @@ cargo run -p gateway-server          # listens on 0.0.0.0:8787 (BWOC_GATEWAY_ADD
 curl localhost:8787/healthz          # → ok
 ```
 
+### Install a release bundle
+
+Every release attaches a checksumed archive for Linux x86_64/ARM64 and macOS
+Intel/Apple Silicon. Download the archive matching your platform from the
+[GitHub Release](https://github.com/bemindlabs/bwoc-gateway/releases/latest),
+verify its adjacent `.sha256` file, then put all three binaries on `PATH`:
+
+```bash
+shasum -a 256 -c bwoc-gateway-<tag>-<target>.tar.gz.sha256
+tar -xzf bwoc-gateway-<tag>-<target>.tar.gz
+install -m 755 bwoc-gateway-<tag>-<target>/bwoc-gateway* ~/.local/bin/
+```
+
+The bundle always contains `bwoc-gateway` (relay server),
+`bwoc-gateway-send`, and `bwoc-gateway-recv`; install them together so an
+agent's transport helpers remain version-aligned with the relay.
+
 Optional environment:
 
 ```bash
